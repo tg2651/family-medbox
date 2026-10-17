@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>家庭用药 · 管理后台</title>
+<style>
+:root{--p:#2563eb;--bg:#f1f5f9;--card:#fff;--txt:#0f172a;--sub:#64748b;--ok:#16a34a;--warn:#d97706;--bad:#dc2626}
+*{box-sizing:border-box;margin:0}
+body{font-family:"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--txt)}
+.login{max-width:360px;margin:12vh auto;background:var(--card);padding:32px;border-radius:14px;box-shadow:0 4px 20px rgba(0,0,0,.08)}
+.login h1{font-size:20px;margin-bottom:20px;text-align:center}
+input,select,button{font:inherit;width:100%;padding:10px 12px;border:1px solid #cbd5e1;border-radius:8px;margin-bottom:12px}
+button{background:var(--p);color:#fff;border:none;cursor:pointer}
+button:hover{opacity:.9}
+.err{color:var(--bad);font-size:13px;margin-bottom:10px;display:none}
+#app{display:none}
+header{background:var(--p);color:#fff;padding:14px 24px;display:flex;justify-content:space-between;align-items:center}
+header .u{font-size:14px;opacity:.9}
+main{max-width:1000px;margin:20px auto;padding:0 16px}
+.tabs{display:flex;gap:8px;margin-bottom:16px}
+.tabs button{background:#e2e8f0;color:var(--txt);width:auto;padding:8px 18px;border-radius:20px}
+.tabs button.act{background:var(--p);color:#fff}
+.card{background:var(--card);border-radius:12px;padding:18px;margin-bottom:14px;box-shadow:0 1px 4px rgba(0,0,0,.06)}
+.card h3{margin-bottom:12px;font-size:16px}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:12px}
+.mem{border:1px solid #e2e8f0;border-radius:10px;padding:14px}
+.mem .nm{font-weight:600;font-size:15px}
+.mem .meta{color:var(--sub);font-size:13px;margin:6px 0}
+.tag{display:inline-block;padding:2px 10px;border-radius:12px;font-size:12px;margin-right:6px}
+.tag.admin{background:#dbeafe;color:var(--p)}
+.tag.warn{background:#fef3c7;color:var(--warn)}
+.tag.bad{background:#fee2e2;color:var(--bad)}
+.tag.ok{background:#dcfce7;color:var(--ok)}
+.med{border-top:1px dashed #e2e8f0;padding:8px 0;font-size:13px;display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap}
+.tbl{width:100%;border-collapse:collapse;font-size:13px}
+.tbl th,.tbl td{padding:8px;border-bottom:1px solid #e2e8f0;text-align:left}
+.sub{color:var(--sub);font-size:12px}
+#alerts .card{border-left:4px solid var(--warn)}
+button.mini{width:auto;padding:5px 12px;font-size:13px;margin:0}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.invite{background:#eff6ff;border:1px dashed var(--p);padding:8px 14px;border-radius:8px;font-size:13px}
+</style>
+</head>
+<body>
+<div class="login" id="login">
+  <h1>家庭用药 · 管理后台</h1>
+  <div class="err" id="lerr"></div>
+  <input id="lu" placeholder="管理员用户名" value="">
+  <input id="lp" type="password" placeholder="密码">
+  <button onclick="doLogin()">登录</button>
+  <div class="sub">提示：注册时创建家庭的第一个账号即管理员；<a href="/">成员网页入口</a></div>
+</div>
+<div id="app">
+  <header>
+    <b>家庭用药 · 管理后台</b>
+    <span class="u" id="huser"></span>
+  </header>
+  <main>
+    <div class="tabs">
+      <button class="act" onclick="tab(0,this)">成员总览</button>
+      <button onclick="tab(1,this)">预警中心</button>
+      <button onclick="tab(2,this)">邀请成员</button>
+    </div>
+    <div id="tab0"></div>
+    <div id="tab1" style="display:none"></div>
+    <div id="tab2" style="display:none"></div>
+  </main>
+</div>
+<script>
+let T=localStorage.getItem('admin_token')||'', me=null, data=null;
+const $=id=>document.getElementById(id);
+const h=(s)=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function api(p,opt={}){const r=await fetch('/api'+p,{...opt,headers:{'Content-Type':'application/json',Authorization:'Bearer '+T,...(opt.headers||{})}});if(r.status===401){T='';localStorage.removeItem('admin_token');location.reload();}const j=await r.json();if(!r.ok)throw new Error(j.error||'请求失败');return j;}
+async function doLogin(){
+  try{
+    const j=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('lu').value,password:$('lp').value})}).then(r=>r.json());
+    if(j.error){$('lerr').textContent=j.error;$('lerr').style.display='block';return;}
+    if(j.user.role!=='admin'){$('lerr').textContent='该账号不是管理员';$('lerr').style.display='block';return;}
+    T=j.token;localStorage.setItem('admin_token',T);init();
+  }catch(e){$('lerr').textContent=e.message;$('lerr').style.display='block';}
+}
+async function init(){
+  try{ me=await api('/me'); }catch(e){return;}
+  if(me.user.role!=='admin'){T='';localStorage.removeItem('admin_token');location.reload();return;}
+  $('login').style.display='none';$('app').style.display='block';
+  $('huser').textContent=me.user.display_name+'（'+me.family.name+'）';
+  data=await api('/admin/overview');
+  render();
+}
+function render(){renderOverview();renderAlerts();renderInvite();}
+function esc(n){return n}
+function tagFor(m){
+  const t=[];
+  const r=m.refill,e=m.expiry;
+  if(r&&r.needRefill)t.push(`<span class="tag ${r.daysLeft<=3?'bad':'warn'}">该开药了·剩${r.daysLeft}天</span>`);
+  if(e&&e.expired)t.push(`<span class="tag bad">已过期</span>`);
+  else if(e&&e.nearExpiry)t.push(`<span class="tag warn">临期·${e.daysLeft}天</span>`);
+  if(!t.length)t.push('<span class="tag ok">正常</span>');
+  return t.join('');
+}
+function renderOverview(){
+  const mems=data.members.map(m=>`
+  <div class="mem">
+    <div class="nm">${h(m.display_name)} ${m.role==='admin'?'<span class="tag admin">管理员</span>':''}</div>
+    <div class="meta">${m.age!=null?h(m.age)+'岁 · ':''}账号 ${h(m.username)}</div>
+    <div class="meta">今日服药：待服 ${m.today_pending} / 共 ${m.today_total} 项</div>
+    <div class="meta">药品 ${m.medicines.length} 种 · 计划 ${m.schedules.length} 条</div>
+    ${m.medicines.length?'<div style="margin-top:8px">'+m.medicines.map(md=>`
+      <div class="med"><span>${h(md.name)} ${h(md.spec)}（余 ${h(md.stock_qty)} ${h(md.unit)}，日用量 ${h(md.daily_dose)} ${h(md.dose_unit)}）</span><span>${tagFor(md)}</span></div>`).join('')+'<div class="sub" style="margin-top:6px">'+(m.notes?('备注：'+h(m.notes)):'')+'</div>':''}
+  </div>`).join('');
+  $('tab0').innerHTML=`<div class="grid">${mems}</div>`;
+}
+function renderAlerts(){
+  const r=data.alerts.refill.map(a=>`<tr><td>${h(a.name)}</td><td>${h(a.owner)}</td><td>剩 ${h(a.stock_qty)} ${h(a.unit)}</td><td>日用量 ${h(a.daily_dose)}</td><td><span class="tag ${a.days_left<=3?'bad':'warn'}">还能服 ${a.days_left} 天</span></td></tr>`).join('');
+  const e=data.alerts.expiry.map(a=>`<tr><td>${h(a.name)}</td><td>${h(a.owner)}</td><td>${h(a.expiry_date)}</td><td>${a.expired?'<span class="tag bad">已过期</span>':`<span class="tag warn">${a.days_left}天后到期</span>`}</td></tr>`).join('');
+  $('tab1').innerHTML=`
+  <div class="card" id="alerts"><h3>该开药了（按老人常用药日用量估算，≤7 天预警）</h3>
+    <table class="tbl"><tr><th>药品</th><th>成员</th><th>库存</th><th>日用量</th><th>可服天数</th></tr>${r||'<tr><td colspan="5" class="sub">暂无预警</td></tr>'}</table></div>
+  <div class="card"><h3>效期预警（≤30 天或已过期）</h3>
+    <table class="tbl"><tr><th>药品</th><th>成员</th><th>有效期至</th><th>状态</th></tr>${e||'<tr><td colspan="4" class="sub">暂无预警</td></tr>'}</table></div>`;
+}
+function renderInvite(){
+  $('tab2').innerHTML=`<div class="card"><h3>家庭成员邀请码</h3>
+  <div class="row"><div class="invite">邀请码：<b>${h(me.family.invite_code)}</b>（新成员在 APP/网页注册时填入即可加入本家庭）</div>
+  <button class="mini" onclick="renewCode()">重新生成</button></div></div>`;
+}
+async function renewCode(){
+  const j=await api('/family/invite-code',{method:'POST'});
+  me.family.invite_code=j.invite_code;renderInvite();
+}
+function tab(i,btn){
+  document.querySelectorAll('.tabs button').forEach(b=>b.classList.remove('act'));
+  btn.classList.add('act');
+  [0,1,2].forEach(k=>$('tab'+k).style.display=k===i?'':'none');
+  if(i===0)init();
+}
+if(T)init();
+</script>
+</body>
+</html>

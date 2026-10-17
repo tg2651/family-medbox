@@ -1,0 +1,798 @@
+@file:OptIn(ExperimentalMaterial3Api::class)
+
+package com.family.medbox
+
+import android.Manifest
+import android.content.Context
+import android.content.pm.PackageManager
+import android.os.Build
+import android.os.Bundle
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Medication
+import androidx.compose.material.icons.filled.Person
+import androidx.compose.material.icons.filled.Schedule
+import androidx.compose.material.icons.filled.Today
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import org.json.JSONArray
+import org.json.JSONObject
+import kotlinx.coroutines.launch
+import java.util.Calendar
+
+// ---------- 主题色 ----------
+private val Blue = Color(0xFF2563EB)
+private val Orange = Color(0xFFD97706)
+private val Red = Color(0xFFDC2626)
+private val Green = Color(0xFF16A34A)
+private val Gray = Color(0xFF64748B)
+
+// ---------- 工具 ----------
+private fun todayStr(): String {
+    val c = Calendar.getInstance()
+    return "%04d-%02d-%02d".format(c.get(Calendar.YEAR), c.get(Calendar.MONTH) + 1, c.get(Calendar.DAY_OF_MONTH))
+}
+
+private fun JSONArray.objs(): List<JSONObject> = (0 until length()).mapNotNull { optJSONObject(it) }
+
+private fun fmtNum(d: Double): String = if (d % 1.0 == 0.0) d.toInt().toString() else d.toString()
+
+/** 拉取最新计划并重新注册本地服药提醒 */
+private suspend fun refreshReminders(ctx: Context) {
+    try {
+        val r = ApiClient.get("/api/schedules")
+        if (r is JSONArray) {
+            Store.saveSchedulesCache(ctx, r)
+            ReminderScheduler.scheduleAll(ctx, r)
+        }
+    } catch (_: Exception) {
+    }
+}
+
+class MainActivity : ComponentActivity() {
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        Store.load(this)
+        setContent {
+            MaterialTheme(colorScheme = lightColorScheme(primary = Blue)) {
+                App()
+            }
+        }
+    }
+}
+
+@Composable
+fun App() {
+    val ctx = LocalContext.current
+    var user by remember { mutableStateOf(Store.user(ctx)) }
+    // 安卓 13+ 请求通知权限（服药提醒）
+    val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {}
+    LaunchedEffect(Unit) {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            ctx.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) permLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+    }
+    if (user == null) LoginScreen { user = Store.user(ctx) }
+    else MainScreen(user!!) { user = null }
+}
+
+// ---------- 登录 / 注册 ----------
+@Composable
+fun LoginScreen(onDone: () -> Unit) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var base by remember { mutableStateOf(Store.baseUrl(ctx)) }
+    var username by remember { mutableStateOf("") }
+    var password by remember { mutableStateOf("") }
+    var name by remember { mutableStateOf("") }
+    var age by remember { mutableStateOf("") }
+    var invite by remember { mutableStateOf("") }
+    var reg by remember { mutableStateOf(false) }
+    var err by remember { mutableStateOf("") }
+    var busy by remember { mutableStateOf(false) }
+
+    Column(
+        Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp),
+        verticalArrangement = Arrangement.Center
+    ) {
+        Text(if (reg) "注册家庭成员" else "家庭药箱", fontSize = 30.sp, fontWeight = FontWeight.Bold, color = Blue)
+        Text("全家人的用药提醒助手", fontSize = 15.sp, color = Gray)
+        Spacer(Modifier.height(24.dp))
+        OutlinedTextField(base, { base = it }, label = { Text("服务器地址") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+        OutlinedTextField(username, { username = it }, label = { Text("用户名") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+        OutlinedTextField(password, { password = it }, label = { Text("密码") },
+            modifier = Modifier.fillMaxWidth(), singleLine = true,
+            visualTransformation = PasswordVisualTransformation())
+        if (reg) {
+            OutlinedTextField(name, { name = it }, label = { Text("姓名 / 称呼") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+            OutlinedTextField(age, { age = it }, label = { Text("年龄（选填）") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+            OutlinedTextField(invite, { invite = it }, label = { Text("邀请码（加入已有家庭，留空=新建）") }, modifier = Modifier.fillMaxWidth(), singleLine = true)
+        }
+        if (err.isNotEmpty()) Text(err, color = Red, fontSize = 14.sp, modifier = Modifier.padding(vertical = 4.dp))
+        Button(
+            onClick = {
+                busy = true; err = ""
+                scope.launch {
+                    try {
+                        ApiClient.baseUrl = base.trim().removeSuffix("/")
+                        if (reg) {
+                            val body = JSONObject()
+                                .put("username", username.trim()).put("password", password)
+                                .put("display_name", name.trim())
+                            if (age.isNotBlank()) body.put("age", age.toInt())
+                            if (invite.isNotBlank()) body.put("invite_code", invite.trim())
+                            val r = ApiClient.post("/api/auth/register", body) as JSONObject
+                            Store.saveLogin(ctx, ApiClient.baseUrl, r.getString("token"), r.getJSONObject("user"))
+                        } else {
+                            val r = ApiClient.post("/api/auth/login",
+                                JSONObject().put("username", username.trim()).put("password", password)) as JSONObject
+                            Store.saveLogin(ctx, ApiClient.baseUrl, r.getString("token"), r.getJSONObject("user"))
+                        }
+                        refreshReminders(ctx)
+                        onDone()
+                    } catch (e: Exception) {
+                        err = e.message ?: "操作失败"
+                    }
+                    busy = false
+                }
+            },
+            enabled = !busy && username.isNotBlank() && password.isNotBlank() && (!reg || name.isNotBlank()),
+            modifier = Modifier.fillMaxWidth().height(52.dp)
+        ) { Text(if (busy) "请稍候…" else if (reg) "注 册" else "登 录", fontSize = 18.sp) }
+        TextButton(onClick = { reg = !reg; err = "" }, modifier = Modifier.align(Alignment.CenterHorizontally)) {
+            Text(if (reg) "已有账号？去登录" else "没有账号？注册新成员")
+        }
+        Text(
+            "首次注册将自动创建家庭并成为管理员；\n加入已有家庭需要管理员提供的邀请码",
+            fontSize = 12.sp, color = Gray
+        )
+    }
+}
+
+// ---------- 主框架：底部四页签 ----------
+@Composable
+fun MainScreen(user: JSONObject, onLogout: () -> Unit) {
+    val ctx = LocalContext.current
+    var tab by remember { mutableIntStateOf(0) }
+    var showAdmin by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { refreshReminders(ctx) }
+
+    if (showAdmin) {
+        AdminScreen(user) { showAdmin = false }
+        return
+    }
+    Scaffold(
+        bottomBar = {
+            NavigationBar {
+                val tabs = listOf(
+                    "今日" to Icons.Filled.Today,
+                    "药品" to Icons.Filled.Medication,
+                    "计划" to Icons.Filled.Schedule,
+                    "我的" to Icons.Filled.Person
+                )
+                tabs.forEachIndexed { i, (label, icon) ->
+                    NavigationBarItem(
+                        selected = tab == i, onClick = { tab = i },
+                        icon = { Icon(icon, label) }, label = { Text(label, fontSize = 13.sp) }
+                    )
+                }
+            }
+        }
+    ) { pad ->
+        Box(Modifier.padding(pad).fillMaxSize()) {
+            when (tab) {
+                0 -> TodayTab(user)
+                1 -> MedsTab(user)
+                2 -> PlansTab(user)
+                else -> ProfileTab(user, onLogout) { showAdmin = true }
+            }
+        }
+    }
+}
+
+// ---------- 今日服药 ----------
+@Composable
+fun TodayTab(user: JSONObject, userId: Int = -1) {
+    // userId >= 0 时为管理员查看指定成员
+    val path = if (userId >= 0) "/api/today?user_id=$userId" else "/api/today"
+    var items by remember { mutableStateOf<List<JSONObject>>(emptyList()) }
+    var loaded by remember { mutableStateOf(false) }
+    var err by remember { mutableStateOf("") }
+    val scope = rememberCoroutineScope()
+
+    suspend fun load() {
+        try {
+            items = (ApiClient.get(path) as? JSONArray)?.objs() ?: emptyList()
+            err = ""
+        } catch (e: Exception) { err = e.message ?: "" }
+        loaded = true
+    }
+    LaunchedEffect(Unit) { load() }
+
+    Column(Modifier.fillMaxSize().padding(16.dp)) {
+        Text("今日服药 · ${user.optString("display_name")}", fontSize = 22.sp, fontWeight = FontWeight.Bold)
+        Text(todayStr(), fontSize = 14.sp, color = Gray)
+        Spacer(Modifier.height(12.dp))
+        if (!loaded) Box(Modifier.fillMaxWidth().padding(24.dp), Alignment.Center) { CircularProgressIndicator() }
+        else if (err.isNotEmpty()) Text(err, color = Red)
+        else if (items.isEmpty()) Text("今天没有用药安排", color = Gray, fontSize = 16.sp, modifier = Modifier.padding(16.dp))
+        else LazyColumn {
+            items(items) { item ->
+                TodayCard(item) { status ->
+                    scope.launch {
+                        try {
+                            ApiClient.post("/api/intake", JSONObject()
+                                .put("schedule_id", item.getInt("schedule_id"))
+                                .put("plan_time", item.getString("plan_time"))
+                                .put("status", status))
+                            load()
+                        } catch (e: Exception) { err = e.message ?: "" }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun TodayCard(item: JSONObject, onMark: (String) -> Unit) {
+    val status = item.optString("status", "pending")
+    Card(Modifier.fillMaxWidth().padding(vertical = 5.dp)) {
+        Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.Bottom) {
+                    Text(item.optString("plan_time"), fontSize = 22.sp, fontWeight = FontWeight.Bold, color = Blue)
+                    Spacer(Modifier.width(10.dp))
+                    Text(item.optString("medicine_name"), fontSize = 18.sp, fontWeight = FontWeight.Bold)
+                }
+                Text(
+                    "每次 ${fmtNum(item.optDouble("dose", 1.0))} ${item.optString("dose_unit", "片")}",
+                    fontSize = 14.sp, color = Gray
+                )
+            }
+            if (status == "pending") {
+                TextButton(onClick = { onMark("taken") }) { Text("服了", color = Green, fontSize = 16.sp) }
+                TextButton(onClick = { onMark("skipped") }) { Text("跳过", color = Gray, fontSize = 16.sp) }
+            } else {
+                Text(
+                    if (status == "taken") "已服 ✓" else "已跳过",
+                    color = if (status == "taken") Green else Gray, fontSize = 15.sp
+                )
+            }
+        }
+    }
+}
+
+// ---------- 我的药品 ----------
+@Composable
+fun MedsTab(user: JSONObject, userId: Int = -1, readOnly: Boolean = false) {
+    val path = if (userId >= 0) "/api/medicines?user_id=$userId" else "/api/medicines"
+    var meds by remember { mutableStateOf<List<JSONObject>>(emptyList()) }
+    var err by remember { mutableStateOf("") }
+    var showAdd by remember { mutableStateOf(false) }
+    var editMed by remember { mutableStateOf<JSONObject?>(null) }
+    var delMed by remember { mutableStateOf<JSONObject?>(null) }
+    val scope = rememberCoroutineScope()
+
+    suspend fun load() {
+        try {
+            meds = (ApiClient.get(path) as? JSONArray)?.objs() ?: emptyList()
+            err = ""
+        } catch (e: Exception) { err = e.message ?: "" }
+    }
+    LaunchedEffect(Unit) { load() }
+
+    Column(Modifier.fillMaxSize().padding(16.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("我的药品（${meds.size}）", fontSize = 22.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+            if (!readOnly) Button(onClick = { showAdd = true }) {
+                Icon(Icons.Filled.Add, null); Text("添加")
+            }
+        }
+        Spacer(Modifier.height(8.dp))
+        if (err.isNotEmpty()) Text(err, color = Red)
+        if (meds.isEmpty() && err.isEmpty()) Text("暂无药品，点右上角「添加」录入", color = Gray, modifier = Modifier.padding(16.dp))
+        LazyColumn {
+            items(meds) { m ->
+                MedCard(m, readOnly, onEdit = { editMed = m }, onDelete = { delMed = m })
+            }
+        }
+    }
+
+    if (showAdd) AddMedDialog(userId) { showAdd = false; scope.launch { load() } }
+    editMed?.let { m ->
+        EditStockDialog(m) {
+            editMed = null
+            scope.launch { load() }
+        }
+    }
+    delMed?.let { m ->
+        AlertDialog(
+            onDismissRequest = { delMed = null },
+            title = { Text("删除药品") },
+            text = { Text("确定删除「${m.optString("name")}」及其用药计划吗？") },
+            confirmButton = {
+                TextButton(onClick = {
+                    delMed = null
+                    scope.launch {
+                        try { ApiClient.delete("/api/medicines/${m.getInt("id")}"); load() } catch (e: Exception) { err = e.message ?: "" }
+                    }
+                }) { Text("删除", color = Red) }
+            },
+            dismissButton = { TextButton(onClick = { delMed = null }) { Text("取消") } }
+        )
+    }
+}
+
+@Composable
+private fun MedCard(m: JSONObject, readOnly: Boolean, onEdit: () -> Unit, onDelete: () -> Unit) {
+    val refill = m.optJSONObject("refill")
+    val expiry = m.optJSONObject("expiry")
+    Card(Modifier.fillMaxWidth().padding(vertical = 5.dp)) {
+        Column(Modifier.padding(14.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text(m.optString("name"), fontSize = 19.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                if (expiry?.optBoolean("expired") == true)
+                    Text("已过期", color = Red, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+                else if (refill?.optBoolean("needRefill") == true)
+                    Text("该开药了", color = Orange, fontWeight = FontWeight.Bold, fontSize = 14.sp)
+            }
+            if (m.optString("spec").isNotEmpty()) Text(m.optString("spec"), fontSize = 14.sp, color = Gray)
+            Text(
+                "余 ${fmtNum(m.optDouble("stock_qty"))} ${m.optString("unit", "盒")} · 日用量 ${fmtNum(m.optDouble("daily_dose"))} ${m.optString("dose_unit", "片")}",
+                fontSize = 15.sp
+            )
+            if (m.optString("expiry_date").isNotEmpty())
+                Text(
+                    "有效期至 ${m.optString("expiry_date")}" +
+                        (if (expiry != null && expiry.optBoolean("nearExpiry") && !expiry.optBoolean("expired"))
+                            "（${expiry.optInt("days_left")} 天后到期）" else ""),
+                    fontSize = 14.sp,
+                    color = if (expiry?.optBoolean("expired") == true) Red
+                        else if (expiry?.optBoolean("nearExpiry") == true) Orange else Gray
+                )
+            if (m.optString("location").isNotEmpty()) Text("存放：${m.optString("location")}", fontSize = 14.sp, color = Gray)
+            if (refill?.optBoolean("needRefill") == true)
+                Text("⚠ 库存仅够服 ${refill.optInt("daysLeft")} 天，请及时开药", color = Orange, fontSize = 15.sp)
+            if (!readOnly) Row {
+                TextButton(onClick = onEdit) { Text("改库存", fontSize = 14.sp) }
+                TextButton(onClick = onDelete) { Text("删除", color = Red, fontSize = 14.sp) }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
+    var name by remember { mutableStateOf("") }
+    var spec by remember { mutableStateOf("") }
+    var expiry by remember { mutableStateOf("") }
+    var stock by remember { mutableStateOf("") }
+    var unit by remember { mutableStateOf("盒") }
+    var dailyDose by remember { mutableStateOf("") }
+    var doseUnit by remember { mutableStateOf("片") }
+    var location by remember { mutableStateOf("") }
+    var notes by remember { mutableStateOf("") }
+    var err by remember { mutableStateOf("") }
+    val scope = rememberCoroutineScope()
+
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text("添加药品") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                OutlinedTextField(name, { name = it }, label = { Text("药品名称 *") }, singleLine = true)
+                OutlinedTextField(spec, { spec = it }, label = { Text("规格（如 0.25g×24片）") }, singleLine = true)
+                OutlinedTextField(expiry, { expiry = it }, label = { Text("有效期至（2026-12-31）") }, singleLine = true)
+                Row {
+                    OutlinedTextField(stock, { stock = it }, label = { Text("库存数量") }, modifier = Modifier.weight(1f), singleLine = true)
+                    Spacer(Modifier.width(8.dp))
+                    OutlinedTextField(unit, { unit = it }, label = { Text("单位") }, modifier = Modifier.weight(1f), singleLine = true)
+                }
+                Text("日用量（用于推算何时该开药）", fontSize = 13.sp, color = Gray, modifier = Modifier.padding(top = 6.dp))
+                Row {
+                    OutlinedTextField(dailyDose, { dailyDose = it }, label = { Text("每日用量") }, modifier = Modifier.weight(1f), singleLine = true)
+                    Spacer(Modifier.width(8.dp))
+                    OutlinedTextField(doseUnit, { doseUnit = it }, label = { Text("单位") }, modifier = Modifier.weight(1f), singleLine = true)
+                }
+                OutlinedTextField(location, { location = it }, label = { Text("存放位置（如 客厅药箱）") }, singleLine = true)
+                OutlinedTextField(notes, { notes = it }, label = { Text("备注") }, singleLine = true)
+                if (err.isNotEmpty()) Text(err, color = Red, fontSize = 13.sp)
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                if (name.isBlank()) { err = "请填写药品名称"; return@TextButton }
+                scope.launch {
+                    try {
+                        val body = JSONObject()
+                            .put("name", name.trim()).put("spec", spec.trim())
+                            .put("expiry_date", expiry.trim())
+                            .put("stock_qty", stock.toDoubleOrNull() ?: 0.0)
+                            .put("unit", unit.trim()).put("daily_dose", dailyDose.toDoubleOrNull() ?: 0.0)
+                            .put("dose_unit", doseUnit.trim()).put("location", location.trim())
+                            .put("notes", notes.trim())
+                        if (userId >= 0) body.put("user_id", userId)
+                        ApiClient.post("/api/medicines", body)
+                        onClose()
+                    } catch (e: Exception) { err = e.message ?: "" }
+                }
+            }) { Text("保存") }
+        },
+        dismissButton = { TextButton(onClick = onClose) { Text("取消") } }
+    )
+}
+
+@Composable
+private fun EditStockDialog(m: JSONObject, onClose: () -> Unit) {
+    var stock by remember { mutableStateOf(fmtNum(m.optDouble("stock_qty"))) }
+    var err by remember { mutableStateOf("") }
+    val scope = rememberCoroutineScope()
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text("修改库存 · ${m.optString("name")}") },
+        text = {
+            Column {
+                Text("当前单位：${m.optString("unit", "盒")}", fontSize = 14.sp, color = Gray)
+                OutlinedTextField(stock, { stock = it }, label = { Text("剩余数量") }, singleLine = true)
+                if (err.isNotEmpty()) Text(err, color = Red, fontSize = 13.sp)
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                scope.launch {
+                    try {
+                        ApiClient.patch("/api/medicines/${m.getInt("id")}",
+                            JSONObject().put("stock_qty", stock.toDoubleOrNull() ?: 0.0))
+                        onClose()
+                    } catch (e: Exception) { err = e.message ?: "" }
+                }
+            }) { Text("保存") }
+        },
+        dismissButton = { TextButton(onClick = onClose) { Text("取消") } }
+    )
+}
+
+// ---------- 用药计划 ----------
+@Composable
+fun PlansTab(user: JSONObject, userId: Int = -1, readOnly: Boolean = false) {
+    val ctx = LocalContext.current
+    val path = if (userId >= 0) "/api/schedules?user_id=$userId" else "/api/schedules"
+    var plans by remember { mutableStateOf<List<JSONObject>>(emptyList()) }
+    var err by remember { mutableStateOf("") }
+    var showAdd by remember { mutableStateOf(false) }
+    var delPlan by remember { mutableStateOf<JSONObject?>(null) }
+    val scope = rememberCoroutineScope()
+
+    suspend fun load() {
+        try {
+            plans = (ApiClient.get(path) as? JSONArray)?.objs() ?: emptyList()
+            err = ""
+        } catch (e: Exception) { err = e.message ?: "" }
+    }
+    LaunchedEffect(Unit) { load() }
+
+    Column(Modifier.fillMaxSize().padding(16.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("用药计划（${plans.size}）", fontSize = 22.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+            if (!readOnly) Button(onClick = { showAdd = true }) {
+                Icon(Icons.Filled.Add, null); Text("新建")
+            }
+        }
+        Text("到点会自动弹出服药提醒", fontSize = 13.sp, color = Gray)
+        Spacer(Modifier.height(8.dp))
+        if (err.isNotEmpty()) Text(err, color = Red)
+        if (plans.isEmpty() && err.isEmpty()) Text("暂无计划，点右上角「新建」", color = Gray, modifier = Modifier.padding(16.dp))
+        LazyColumn {
+            items(plans) { p -> PlanCard(p, readOnly, onToggle = { en -> scope.launch {
+                try {
+                    ApiClient.patch("/api/schedules/${p.getInt("id")}", JSONObject().put("enabled", en))
+                    load(); refreshReminders(ctx)
+                } catch (e: Exception) { err = e.message ?: "" }
+            } }, onDelete = { delPlan = p }) }
+        }
+    }
+
+    if (showAdd) AddPlanDialog(userId) { showAdd = false; scope.launch { load(); refreshReminders(ctx) } }
+    delPlan?.let { p ->
+        AlertDialog(
+            onDismissRequest = { delPlan = null },
+            title = { Text("删除计划") },
+            text = { Text("确定删除「${p.optString("medicine_name")}」的用药计划吗？") },
+            confirmButton = {
+                TextButton(onClick = {
+                    delPlan = null
+                    scope.launch {
+                        try { ApiClient.delete("/api/schedules/${p.getInt("id")}"); load(); refreshReminders(ctx) }
+                        catch (e: Exception) { err = e.message ?: "" }
+                    }
+                }) { Text("删除", color = Red) }
+            },
+            dismissButton = { TextButton(onClick = { delPlan = null }) { Text("取消") } }
+        )
+    }
+}
+
+@Composable
+private fun PlanCard(p: JSONObject, readOnly: Boolean, onToggle: (Boolean) -> Unit, onDelete: () -> Unit) {
+    val times = p.optJSONArray("times")?.let { (0 until it.length()).joinToString("  ") { i -> it.optString(i) } } ?: ""
+    val freq = if (p.optString("frequency") == "interval") "隔 ${p.optInt("interval_days", 1)} 天一次" else "每天"
+    val enabled = p.optInt("enabled", 1) == 1
+    Card(Modifier.fillMaxWidth().padding(vertical = 5.dp)) {
+        Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
+            Column(Modifier.weight(1f)) {
+                Text(p.optString("medicine_name"), fontSize = 19.sp, fontWeight = FontWeight.Bold)
+                Text("$times · 每次 ${fmtNum(p.optDouble("dose_per_time", 1.0))} ${p.optString("dose_unit", "片")}", fontSize = 15.sp)
+                Text("$freq · ${p.optString("start_date")} 起" +
+                    (if (p.optString("end_date").isNotEmpty()) " 至 ${p.optString("end_date")}" else ""), fontSize = 13.sp, color = Gray)
+            }
+            if (readOnly) {
+                Text(if (enabled) "启用中" else "已停用", color = if (enabled) Green else Gray, fontSize = 14.sp)
+            } else {
+                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Switch(checked = enabled, onCheckedChange = onToggle)
+                    TextButton(onClick = onDelete) { Text("删除", color = Red, fontSize = 13.sp) }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AddPlanDialog(userId: Int, onClose: () -> Unit) {
+    var meds by remember { mutableStateOf<List<JSONObject>>(emptyList()) }
+    var medIdx by remember { mutableIntStateOf(-1) }
+    var timesText by remember { mutableStateOf("08:00") }
+    var dose by remember { mutableStateOf("1") }
+    var doseUnit by remember { mutableStateOf("片") }
+    var interval by remember { mutableStateOf(false) }
+    var intervalDays by remember { mutableStateOf("2") }
+    var start by remember { mutableStateOf(todayStr()) }
+    var end by remember { mutableStateOf("") }
+    var err by remember { mutableStateOf("") }
+    var expanded by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
+
+    LaunchedEffect(Unit) {
+        try { meds = (ApiClient.get("/api/medicines") as? JSONArray)?.objs() ?: emptyList() }
+        catch (e: Exception) { err = e.message ?: "" }
+    }
+
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text("新建用药计划") },
+        text = {
+            Column(Modifier.verticalScroll(rememberScrollState())) {
+                // 药品下拉选择
+                ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }) {
+                    OutlinedTextField(
+                        value = if (medIdx in meds.indices) meds[medIdx].optString("name") else "",
+                        onValueChange = {},
+                        readOnly = true,
+                        label = { Text("选择药品 *") },
+                        modifier = Modifier.fillMaxWidth().menuAnchor(),
+                        placeholder = { if (meds.isEmpty()) Text("请先添加药品") else Text("点击选择") }
+                    )
+                    ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
+                        meds.forEachIndexed { i, m ->
+                            DropdownMenuItem(text = { Text(m.optString("name")) }, onClick = { medIdx = i; expanded = false })
+                        }
+                    }
+                }
+                OutlinedTextField(timesText, { timesText = it },
+                    label = { Text("服药时间（逗号分隔，如 08:00,12:00,20:00）") }, singleLine = true)
+                Row {
+                    OutlinedTextField(dose, { dose = it }, label = { Text("每次剂量") }, modifier = Modifier.weight(1f), singleLine = true)
+                    Spacer(Modifier.width(8.dp))
+                    OutlinedTextField(doseUnit, { doseUnit = it }, label = { Text("单位") }, modifier = Modifier.weight(1f), singleLine = true)
+                }
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    FilterChip(selected = !interval, onClick = { interval = false }, label = { Text("每天") })
+                    Spacer(Modifier.width(8.dp))
+                    FilterChip(selected = interval, onClick = { interval = true }, label = { Text("隔 N 天") })
+                    if (interval) {
+                        Spacer(Modifier.width(8.dp))
+                        OutlinedTextField(intervalDays, { intervalDays = it },
+                            label = { Text("N") }, modifier = Modifier.width(80.dp), singleLine = true)
+                    }
+                }
+                OutlinedTextField(start, { start = it }, label = { Text("开始日期（2026-10-17）") }, singleLine = true)
+                OutlinedTextField(end, { end = it }, label = { Text("结束日期（选填）") }, singleLine = true)
+                if (err.isNotEmpty()) Text(err, color = Red, fontSize = 13.sp)
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = {
+                err = ""
+                if (medIdx !in meds.indices) { err = "请选择药品"; return@TextButton }
+                val times = timesText.split(",", "，", " ").map { it.trim() }
+                    .filter { Regex("\\d{1,2}:\\d{2}").matches(it) }
+                if (times.isEmpty()) { err = "请填写正确的服药时间（HH:mm）"; return@TextButton }
+                if (!Regex("\\d{4}-\\d{2}-\\d{2}").matches(start)) { err = "开始日期格式：2026-10-17"; return@TextButton }
+                scope.launch {
+                    try {
+                        val body = JSONObject()
+                            .put("medicine_id", meds[medIdx].getInt("id"))
+                            .put("times", JSONArray(times))
+                            .put("dose_per_time", dose.toDoubleOrNull() ?: 1.0)
+                            .put("dose_unit", doseUnit.trim())
+                            .put("frequency", if (interval) "interval" else "daily")
+                            .put("interval_days", intervalDays.toIntOrNull() ?: 2)
+                            .put("start_date", start)
+                        if (end.isNotBlank()) body.put("end_date", end.trim())
+                        ApiClient.post("/api/schedules", body)
+                        onClose()
+                    } catch (e: Exception) { err = e.message ?: "" }
+                }
+            }) { Text("保存") }
+        },
+        dismissButton = { TextButton(onClick = onClose) { Text("取消") } }
+    )
+}
+
+// ---------- 我的 ----------
+@Composable
+fun ProfileTab(user: JSONObject, onLogout: () -> Unit, onAdmin: () -> Unit) {
+    val ctx = LocalContext.current
+    var family by remember { mutableStateOf<JSONObject?>(null) }
+    var err by remember { mutableStateOf("") }
+    LaunchedEffect(Unit) {
+        try { family = ApiClient.get("/api/me") as? JSONObject } catch (e: Exception) { err = e.message ?: "" }
+    }
+    Column(Modifier.fillMaxSize().padding(16.dp).verticalScroll(rememberScrollState())) {
+        Text("我的", fontSize = 22.sp, fontWeight = FontWeight.Bold)
+        Spacer(Modifier.height(12.dp))
+        Card(Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(user.optString("display_name"), fontSize = 22.sp, fontWeight = FontWeight.Bold)
+                    Spacer(Modifier.width(8.dp))
+                    if (user.optString("role") == "admin")
+                        Text("管理员", color = Blue, fontSize = 13.sp,
+                            modifier = Modifier.padding(4.dp))
+                }
+                Text("账号：${user.optString("username")}", fontSize = 14.sp, color = Gray)
+                if (user.optInt("age", -1) >= 0) Text("年龄：${user.optInt("age")} 岁", fontSize = 14.sp, color = Gray)
+                family?.optJSONObject("family")?.let { f ->
+                    Spacer(Modifier.height(8.dp))
+                    Text("家庭：${f.optString("name")}", fontSize = 16.sp)
+                    Text("邀请码：${f.optString("invite_code")}（新成员注册时填此码加入家庭）", fontSize = 14.sp, color = Gray)
+                }
+                if (err.isNotEmpty()) Text(err, color = Red, fontSize = 13.sp)
+            }
+        }
+        Spacer(Modifier.height(16.dp))
+        if (user.optString("role") == "admin") {
+            Button(onClick = onAdmin, modifier = Modifier.fillMaxWidth().height(52.dp)) {
+                Text("管理员模式 · 查看全家成员", fontSize = 17.sp)
+            }
+            Spacer(Modifier.height(12.dp))
+        }
+        OutlinedButton(
+            onClick = { Store.logout(ctx); onLogout() },
+            modifier = Modifier.fillMaxWidth().height(52.dp)
+        ) { Text("退出登录", fontSize = 17.sp) }
+        Spacer(Modifier.height(24.dp))
+        Text("提示：服药提醒由手机本地闹钟触发，请保持 APP 后台运行并允许通知与精确闹钟权限",
+            fontSize = 12.sp, color = Gray)
+    }
+}
+
+// ---------- 管理员模式 ----------
+@Composable
+fun AdminScreen(admin: JSONObject, onBack: () -> Unit) {
+    var overview by remember { mutableStateOf<JSONObject?>(null) }
+    var members by remember { mutableStateOf<List<JSONObject>>(emptyList()) }
+    var selId by remember { mutableIntStateOf(-1) }
+    var subTab by remember { mutableIntStateOf(0) }
+    var err by remember { mutableStateOf("") }
+
+    LaunchedEffect(Unit) {
+        try {
+            overview = ApiClient.get("/api/admin/overview") as? JSONObject
+            members = overview?.optJSONArray("members")?.objs() ?: emptyList()
+            if (members.isNotEmpty() && selId < 0) selId = members[0].optInt("id")
+        } catch (e: Exception) { err = e.message ?: "" }
+    }
+
+    Column(Modifier.fillMaxSize()) {
+        // 顶栏
+        Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+            IconButton(onClick = onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "返回") }
+            Text("管理员模式 · ${admin.optString("display_name")}", fontSize = 19.sp, fontWeight = FontWeight.Bold)
+        }
+        if (err.isNotEmpty()) Text(err, color = Red, modifier = Modifier.padding(16.dp))
+
+        // 成员选择
+        Row(Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()).padding(horizontal = 12.dp)) {
+            members.forEach { m ->
+                FilterChip(
+                    selected = selId == m.optInt("id"),
+                    onClick = { selId = m.optInt("id") },
+                    label = { Text(m.optString("display_name") + if (m.optInt("today_pending", 0) > 0) " (${m.optInt("today_pending")})" else "") },
+                    modifier = Modifier.padding(end = 8.dp)
+                )
+            }
+        }
+        // 子页签
+        TabRow(selectedTabIndex = subTab) {
+            listOf("今日", "药品", "计划", "全家预警").forEachIndexed { i, label ->
+                Tab(selected = subTab == i, onClick = { subTab = i }, text = { Text(label) })
+            }
+        }
+        val member = members.find { it.optInt("id") == selId }
+        Box(Modifier.weight(1f)) {
+            when {
+                overview == null -> Box(Modifier.fillMaxSize(), Alignment.Center) { CircularProgressIndicator() }
+                subTab == 3 -> AlertsPanel(overview!!)
+                member != null -> when (subTab) {
+                    0 -> TodayTab(member, member.optInt("id"))
+                    1 -> MedsTab(member, member.optInt("id"), readOnly = true)
+                    else -> PlansTab(member, member.optInt("id"), readOnly = true)
+                }
+            }
+        }
+    }
+}
+
+/** 全家开药/效期预警 */
+@Composable
+private fun AlertsPanel(overview: JSONObject) {
+    val refill = overview.optJSONObject("alerts")?.optJSONArray("refill")?.objs() ?: emptyList()
+    val expiry = overview.optJSONObject("alerts")?.optJSONArray("expiry")?.objs() ?: emptyList()
+    LazyColumn(Modifier.fillMaxSize().padding(16.dp)) {
+        item {
+            Text("该开药了（按日用量估算 ≤7 天）", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Orange)
+            if (refill.isEmpty()) Text("暂无预警 ✓", color = Gray, modifier = Modifier.padding(vertical = 8.dp))
+        }
+        items(refill) { r ->
+            Card(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                Column(Modifier.padding(12.dp)) {
+                    Row {
+                        Text(r.optString("name"), fontSize = 17.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                        Text("还能服 ${r.optInt("days_left")} 天", color = if (r.optInt("days_left") <= 3) Red else Orange,
+                            fontSize = 15.sp, fontWeight = FontWeight.Bold)
+                    }
+                    Text("${r.optString("owner")} · 剩 ${fmtNum(r.optDouble("stock_qty"))} ${r.optString("unit")} · 日用 ${fmtNum(r.optDouble("daily_dose"))}",
+                        fontSize = 13.sp, color = Gray)
+                }
+            }
+        }
+        item {
+            Spacer(Modifier.height(16.dp))
+            Text("效期预警（≤30 天或已过期）", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Orange)
+            if (expiry.isEmpty()) Text("暂无预警 ✓", color = Gray, modifier = Modifier.padding(vertical = 8.dp))
+        }
+        items(expiry) { e ->
+            Card(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                Column(Modifier.padding(12.dp)) {
+                    Row {
+                        Text(e.optString("name"), fontSize = 17.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+                        if (e.optBoolean("expired")) Text("已过期", color = Red, fontWeight = FontWeight.Bold)
+                        else Text("${e.optInt("days_left")} 天后到期", color = Orange)
+                    }
+                    Text("${e.optString("owner")} · 有效期至 ${e.optString("expiry_date")}", fontSize = 13.sp, color = Gray)
+                }
+            }
+        }
+    }
+}

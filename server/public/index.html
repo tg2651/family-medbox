@@ -1,0 +1,125 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>家庭用药 · 成员端</title>
+<style>
+:root{--p:#2563eb;--bg:#f1f5f9;--card:#fff;--txt:#0f172a;--sub:#64748b;--ok:#16a34a;--warn:#d97706;--bad:#dc2626}
+*{box-sizing:border-box;margin:0}
+body{font-family:"PingFang SC","Microsoft YaHei",sans-serif;background:var(--bg);color:var(--txt)}
+.box{max-width:480px;margin:8vh auto;padding:0 16px}
+.card{background:var(--card);border-radius:14px;padding:24px;margin-bottom:14px;box-shadow:0 1px 4px rgba(0,0,0,.06)}
+h1{font-size:19px;margin-bottom:18px;text-align:center}
+input,select,button{font:inherit;width:100%;padding:10px 12px;border:1px solid #cbd5e1;border-radius:8px;margin-bottom:10px}
+button{background:var(--p);color:#fff;border:none;cursor:pointer}
+.err{color:var(--bad);font-size:13px;margin-bottom:8px;display:none}
+.tabbar{display:flex;gap:8px;margin-bottom:14px}
+.tabbar button{background:#e2e8f0;color:var(--txt);width:auto;padding:8px 18px;border-radius:20px}
+.tabbar button.act{background:var(--p);color:#fff}
+.item{border-top:1px dashed #e2e8f0;padding:10px 0;display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
+.it-t{font-weight:600;font-size:18px;color:var(--p);width:56px}
+.mname{font-weight:600}
+.sub{color:var(--sub);font-size:12px}
+.pill{padding:5px 14px;border-radius:16px;font-size:13px;width:auto;margin:0}
+.pill.taken{background:#dcfce7;color:var(--ok)}
+.pill.pending{background:#fef3c7;color:var(--warn)}
+.pill.skip{background:#e2e8f0;color:var(--sub)}
+.med{border:1px solid #e2e8f0;border-radius:10px;padding:12px;margin-bottom:10px}
+.med .t{font-weight:600}
+.warn{color:var(--warn);font-size:13px}
+.bad{color:var(--bad);font-size:13px}
+.row{display:flex;gap:8px}
+.row>*{flex:1}
+a{color:var(--p)}
+</style>
+</head>
+<body>
+<div class="box">
+<div class="card" id="login">
+  <h1>家庭用药 · 成员端</h1>
+  <div class="err" id="lerr"></div>
+  <input id="lu" placeholder="用户名">
+  <input id="lp" type="password" placeholder="密码">
+  <button onclick="doLogin()">登录</button>
+  <div class="sub">没有账号？<a href="#" onclick="showReg();return false;">注册新成员</a>（首次创建家庭即管理员；加入已有家庭需邀请码）<br>管理员请用 <a href="/admin.html">管理后台</a></div>
+</div>
+<div class="card" id="reg" style="display:none">
+  <h1>注册家庭成员</h1>
+  <div class="err" id="rerr"></div>
+  <input id="ru" placeholder="用户名（登录用）">
+  <input id="rp" type="password" placeholder="密码">
+  <input id="rn" placeholder="姓名/称呼">
+  <input id="ra" type="number" placeholder="年龄（选填）">
+  <input id="rc" placeholder="邀请码（加入已有家庭；留空=新建家庭）">
+  <button onclick="doReg()">注册</button>
+  <div class="sub"><a href="#" onclick="showLogin();return false;">返回登录</a></div>
+</div>
+<div id="app" style="display:none">
+  <div class="tabbar">
+    <button class="act" onclick="tab(0,this)">今日</button>
+    <button onclick="tab(1,this)">我的药品</button>
+    <button onclick="tab(2,this)">开药提醒</button>
+  </div>
+  <div id="tab0"></div>
+  <div id="tab1" style="display:none"></div>
+  <div id="tab2" style="display:none"></div>
+</div>
+</div>
+<script>
+let T=localStorage.getItem('token')||'',me=null;
+const $=id=>document.getElementById(id);
+const h=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+async function api(p,opt={}){const r=await fetch('/api'+p,{...opt,headers:{'Content-Type':'application/json',Authorization:'Bearer '+T,...(opt.headers||{})}});if(r.status===401){T='';localStorage.removeItem('token');location.reload();}const j=await r.json();if(!r.ok)throw new Error(j.error);return j;}
+function showReg(){$('login').style.display='none';$('reg').style.display='';}
+function showLogin(){$('reg').style.display='none';$('login').style.display='';}
+async function doLogin(){
+  const j=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:$('lu').value,password:$('lp').value})}).then(r=>r.json());
+  if(j.error){$('lerr').textContent=j.error;$('lerr').style.display='block';return;}
+  T=j.token;localStorage.setItem('token',T);init();
+}
+async function doReg(){
+  const b={username:$('ru').value,password:$('rp').value,display_name:$('rn').value};
+  if($('ra').value)b.age=+$('ra').value;
+  if($('rc').value)b.invite_code=$('rc').value;
+  const j=await fetch('/api/auth/register',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}).then(r=>r.json());
+  if(j.error){$('rerr').textContent=j.error;$('rerr').style.display='block';return;}
+  T=j.token;localStorage.setItem('token',T);init();
+}
+async function init(){
+  try{me=await api('/me');}catch(e){return;}
+  $('login').style.display='none';$('reg').style.display='none';$('app').style.display='';
+  renderToday();renderMeds();renderAlerts();
+}
+async function renderToday(){
+  const items=await api('/today');
+  $('tab0').innerHTML=`<div class="card"><h1 style="font-size:16px">今日服药（${me.user.display_name}）</h1>`+
+  (items.length?items.map(i=>`<div class="item"><div><span class="it-t">${h(i.plan_time)}</span> <span class="mname">${h(i.medicine_name)}</span> <span class="sub">${h(i.dose)} ${h(i.dose_unit)}</span></div>
+   <span><button class="pill taken" onclick="mark(${i.schedule_id},'${i.plan_time}','taken')">服了</button>
+   <button class="pill skip" onclick="mark(${i.schedule_id},'${i.plan_time}','skipped')">跳过</button></span></div>`).join('')
+  :'<div class="sub">今天没有用药安排</div>')+'</div>';
+}
+async function mark(sid,time,st){await api('/intake',{method:'POST',body:JSON.stringify({schedule_id:sid,plan_time:time,status:st})});renderToday();renderMeds();}
+async function renderMeds(){
+  const meds=await api('/medicines');
+  $('tab1').innerHTML=`<div class="card"><h1 style="font-size:16px">我的药品（${meds.length}）</h1>`+
+  (meds.length?meds.map(m=>`<div class="med"><div class="t">${h(m.name)} <span class="sub">${h(m.spec)} ${h(m.category)}</span></div>
+  <div class="sub">余 ${h(m.stock_qty)} ${h(m.unit)} · 日用量 ${h(m.daily_dose)} ${h(m.dose_unit)} ${m.expiry_date?('· 有效期至 '+h(m.expiry_date)):''} ${m.location?('· 存放：'+h(m.location)):''}</div>
+  ${m.refill&&m.refill.needRefill?`<div class="warn">库存仅够 ${m.refill.daysLeft} 天，该开药了</div>`:''}
+  ${m.expiry&&m.expiry.expired?'<div class="bad">已过期，请勿服用</div>':(m.expiry&&m.expiry.nearExpiry?`<div class="warn">${m.expiry.daysLeft} 天后到期</div>`:'')}</div>`).join('')
+  :'<div class="sub">暂无药品，请先由管理员或 APP 添加</div>')+'</div>';
+}
+async function renderAlerts(){
+  const a=await api('/alerts');
+  $('tab2').innerHTML=`<div class="card"><h1 style="font-size:16px">开药提醒</h1>`+
+  (a.refill.length?a.refill.map(x=>`<div class="item"><div><span class="mname">${h(x.name)}</span> <span class="sub">${h(x.owner)} · 剩 ${h(x.stock_qty)} ${h(x.unit)} · 日用 ${h(x.daily_dose)}</span></div><span class="warn">还能服 ${x.days_left} 天</span></div>`).join('')
+  :'<div class="sub">暂无开药预警</div>')+`</div>
+  <div class="card"><h1 style="font-size:16px">效期预警</h1>`+
+  (a.expiry.length?a.expiry.map(x=>`<div class="item"><div><span class="mname">${h(x.name)}</span> <span class="sub">${h(x.owner)} · ${h(x.expiry_date)}</span></div>${x.expired?'<span class="bad">已过期</span>':`<span class="warn">${x.days_left}天</span>`}</div>`).join('')
+  :'<div class="sub">暂无痛期预警</div>')+'</div>';
+}
+function tab(i,btn){document.querySelectorAll('.tabbar button').forEach(b=>b.classList.remove('act'));btn.classList.add('act');[0,1,2].forEach(k=>$('tab'+k).style.display=k===i?'':'none');}
+if(T)init();
+</script>
+</body>
+</html>

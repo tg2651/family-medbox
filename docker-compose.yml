@@ -1,0 +1,12 @@
+version: "3"
+services:
+  medbox:
+    build: ./server
+    container_name: family-medbox
+    ports:
+      - "3820:3000"
+    volumes:
+      - medbox-data:/data
+    restart: unless-stopped
+volumes:
+  medbox-data:

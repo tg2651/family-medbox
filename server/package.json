@@ -1,0 +1,16 @@
+{
+  "name": "family-medbox-server",
+  "version": "1.0.0",
+  "private": true,
+  "description": "家庭用药管理 APP 服务端（成员独立账号 + 管理员后台）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  },
+  "engines": {
+    "node": ">=22.13"
+  }
+}
