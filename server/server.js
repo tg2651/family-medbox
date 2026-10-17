@@ -7,8 +7,11 @@ const fs = require('fs');
 
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 fs.mkdirSync(DATA_DIR, { recursive: true });
+fs.mkdirSync(path.join(DATA_DIR, 'uploads'), { recursive: true });
 const db = new DatabaseSync(path.join(DATA_DIR, 'medbox.db'));
 db.exec('PRAGMA journal_mode = WAL');
+// 旧库兼容：补 image_url 列
+try { db.exec('ALTER TABLE medicines ADD COLUMN image_url TEXT DEFAULT \'\''); } catch (e) {}
 
 // ---------- 工具 ----------
 function hashPwd(pw, salt) {
@@ -76,6 +79,7 @@ CREATE TABLE IF NOT EXISTS medicines(
   dose_unit TEXT DEFAULT '片',
   location TEXT DEFAULT '',
   notes TEXT DEFAULT '',
+  image_url TEXT DEFAULT '',
   created_at TEXT DEFAULT (datetime('now','localtime'))
 );
 CREATE TABLE IF NOT EXISTS schedules(
@@ -142,7 +146,7 @@ function getSchedules(userId) {
 
 // ---------- API ----------
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true }));
 // 兼容部分 HTTP 客户端（如安卓 HttpURLConnection）无法直接发送 PATCH：POST + X-HTTP-Method-Override 头转换
 app.use((req, res, next) => {
@@ -151,6 +155,8 @@ app.use((req, res, next) => {
   next();
 });
 app.use(express.static(path.join(__dirname, 'public')));
+// 上传的药品图片
+app.use('/uploads', express.static(path.join(DATA_DIR, 'uploads')));
 
 // --- 认证 ---
 app.post('/api/auth/register', (req, res) => {
@@ -226,14 +232,25 @@ app.get('/api/medicines', requireAuth, (req, res) => {
   res.json(meds);
 });
 
+// --- 药品图片上传（base64） ---
+app.post('/api/upload', requireAuth, (req, res) => {
+  const data = (req.body.image || '').replace(/^data:image\/\w+;base64,/, '');
+  if (!data) return bad(res, '图片数据为空');
+  const buf = Buffer.from(data, 'base64');
+  if (buf.length > 8 * 1024 * 1024) return bad(res, '图片过大（限 8MB）');
+  const name = `med_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.jpg`;
+  fs.writeFileSync(path.join(DATA_DIR, 'uploads', name), buf);
+  res.json({ url: `/uploads/${name}` });
+});
+
 app.post('/api/medicines', requireAuth, (req, res) => {
-  const { name, spec, category, expiry_date, stock_qty, unit, daily_dose, dose_unit, location, notes } = req.body;
+  const { name, spec, category, expiry_date, stock_qty, unit, daily_dose, dose_unit, location, notes, image_url } = req.body;
   if (!name) return bad(res, '药品名称必填');
   let uid = req.user.id;
   if (req.body.user_id && req.user.role === 'admin') uid = +req.body.user_id;
-  const info = db.prepare(`INSERT INTO medicines(family_id,user_id,name,spec,category,expiry_date,stock_qty,unit,daily_dose,dose_unit,location,notes)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(req.user.family_id, uid, name, spec || '', category || '', expiry_date || '', +stock_qty || 0, unit || '盒', +daily_dose || 0, dose_unit || '片', location || '', notes || '');
+  const info = db.prepare(`INSERT INTO medicines(family_id,user_id,name,spec,category,expiry_date,stock_qty,unit,daily_dose,dose_unit,location,notes,image_url)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(req.user.family_id, uid, name, spec || '', category || '', expiry_date || '', +stock_qty || 0, unit || '盒', +daily_dose || 0, dose_unit || '片', location || '', notes || '', image_url || '');
   res.json({ id: Number(info.lastInsertRowid) });
 });
 
@@ -241,7 +258,7 @@ app.patch('/api/medicines/:id', requireAuth, (req, res) => {
   const m = db.prepare('SELECT * FROM medicines WHERE id=?').get(req.params.id);
   if (!m || m.family_id !== req.user.family_id) return bad(res, '药品不存在');
   if (m.user_id !== req.user.id && req.user.role !== 'admin') return bad(res, '无权限');
-  const f = ['name', 'spec', 'category', 'expiry_date', 'stock_qty', 'unit', 'daily_dose', 'dose_unit', 'location', 'notes'];
+  const f = ['name', 'spec', 'category', 'expiry_date', 'stock_qty', 'unit', 'daily_dose', 'dose_unit', 'location', 'notes', 'image_url'];
   const sets = [], vals = [];
   for (const k of f) if (req.body[k] !== undefined) { sets.push(`${k}=?`); vals.push(req.body[k]); }
   if (sets.length) db.prepare(`UPDATE medicines SET ${sets.join(',')} WHERE id=?`).run(...vals, m.id);

@@ -5,13 +5,19 @@ package com.family.medbox
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.graphics.Bitmap
+import android.graphics.BitmapFactory
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -20,6 +26,8 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.CameraAlt
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Medication
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Schedule
@@ -29,14 +37,24 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
+import androidx.core.content.FileProvider
 import org.json.JSONArray
 import org.json.JSONObject
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.net.URL
 import java.util.Calendar
 
 // ---------- 主题色 ----------
@@ -55,6 +73,91 @@ private fun todayStr(): String {
 private fun JSONArray.objs(): List<JSONObject> = (0 until length()).mapNotNull { optJSONObject(it) }
 
 private fun fmtNum(d: Double): String = if (d % 1.0 == 0.0) d.toInt().toString() else d.toString()
+
+// ---------- 图片工具 ----------
+private fun newPhotoUri(ctx: Context): Uri {
+    val file = File(ctx.cacheDir, "med_${System.currentTimeMillis()}.jpg")
+    return FileProvider.getUriForFile(ctx, "${ctx.packageName}.fileprovider", file)
+}
+
+// 缩放并压缩为 base64（最大边 1024，JPEG 80 质量）
+private fun imageToBase64(ctx: Context, uri: Uri): String {
+    val bmp = ctx.contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) } ?: return ""
+    val maxDim = 1024
+    val scale = maxOf(1, maxOf(bmp.width, bmp.height) / maxDim)
+    val scaled = if (scale > 1) Bitmap.createScaledBitmap(bmp, bmp.width / scale, bmp.height / scale, true) else bmp
+    val out = ByteArrayOutputStream()
+    scaled.compress(Bitmap.CompressFormat.JPEG, 80, out)
+    return android.util.Base64.encodeToString(out.toByteArray(), android.util.Base64.NO_WRAP)
+}
+
+/** 远程图片（从服务器加载） */
+@Composable
+fun RemoteImage(url: String, modifier: Modifier = Modifier, contentScale: ContentScale = ContentScale.Crop) {
+    val fullUrl = if (url.startsWith("http")) url else ApiClient.baseUrl + url
+    var bmp by remember(url) { mutableStateOf<androidx.compose.ui.graphics.ImageBitmap?>(null) }
+    LaunchedEffect(url) {
+        bmp = withContext(Dispatchers.IO) {
+            try {
+                val bytes = URL(fullUrl).readBytes()
+                BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.asImageBitmap()
+            } catch (e: Exception) { null }
+        }
+    }
+    val b = bmp
+    if (b != null) Image(b, contentDescription = null, modifier = modifier, contentScale = contentScale)
+    else Box(modifier, Alignment.Center) { CircularProgressIndicator(Modifier.size(24.dp)) }
+}
+
+/** 药品拍照录入按钮：拍照→上传→返回图片 url */
+@Composable
+private fun MedPhotoPicker(imageUrl: String?, onPicked: (String) -> Unit, onClear: () -> Unit) {
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var photoUri by remember { mutableStateOf<Uri?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    var err by remember { mutableStateOf("") }
+
+    val camLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
+        if (ok && photoUri != null) {
+            scope.launch {
+                busy = true; err = ""
+                try {
+                    val b64 = imageToBase64(ctx, photoUri!!)
+                    val r = ApiClient.post("/api/upload", JSONObject().put("image", b64)) as JSONObject
+                    onPicked(r.getString("url"))
+                } catch (e: Exception) { err = e.message ?: "上传失败" }
+                busy = false
+            }
+        }
+    }
+    val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
+        if (it) { val u = newPhotoUri(ctx); photoUri = u; camLauncher.launch(u) }
+    }
+
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        OutlinedButton(onClick = {
+            if (busy) return@OutlinedButton
+            if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                val u = newPhotoUri(ctx); photoUri = u; camLauncher.launch(u)
+            } else permLauncher.launch(Manifest.permission.CAMERA)
+        }) {
+            Icon(Icons.Filled.CameraAlt, null, Modifier.size(18.dp))
+            Spacer(Modifier.width(6.dp))
+            Text(if (busy) "上传中…" else "拍照录入")
+        }
+        if (!imageUrl.isNullOrEmpty()) {
+            Spacer(Modifier.width(8.dp))
+            Box {
+                RemoteImage(imageUrl, Modifier.size(72.dp).clip(RoundedCornerShape(8.dp)))
+                IconButton(onClick = onClear, Modifier.align(Alignment.TopEnd).size(20.dp)) {
+                    Icon(Icons.Filled.Close, "移除", Modifier.size(16.dp))
+                }
+            }
+        }
+        if (err.isNotEmpty()) Text(err, color = Red, fontSize = 12.sp, modifier = Modifier.padding(start = 8.dp))
+    }
+}
 
 /** 拉取最新计划并重新注册本地服药提醒 */
 private suspend fun refreshReminders(ctx: Context) {
@@ -348,7 +451,15 @@ private fun MedCard(m: JSONObject, readOnly: Boolean, onEdit: () -> Unit, onDele
     val refill = m.optJSONObject("refill")
     val expiry = m.optJSONObject("expiry")
     Card(Modifier.fillMaxWidth().padding(vertical = 5.dp)) {
-        Column(Modifier.padding(14.dp)) {
+        Row(Modifier.padding(14.dp), verticalAlignment = Alignment.Top) {
+            if (m.optString("image_url").isNotEmpty()) {
+                RemoteImage(
+                    m.optString("image_url"),
+                    Modifier.size(64.dp).clip(RoundedCornerShape(8.dp))
+                )
+                Spacer(Modifier.width(12.dp))
+            }
+            Column(Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(m.optString("name"), fontSize = 19.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
                 if (expiry?.optBoolean("expired") == true)
@@ -377,6 +488,7 @@ private fun MedCard(m: JSONObject, readOnly: Boolean, onEdit: () -> Unit, onDele
                 TextButton(onClick = onEdit) { Text("改库存", fontSize = 14.sp) }
                 TextButton(onClick = onDelete) { Text("删除", color = Red, fontSize = 14.sp) }
             }
+            }
         }
     }
 }
@@ -392,6 +504,7 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
     var doseUnit by remember { mutableStateOf("片") }
     var location by remember { mutableStateOf("") }
     var notes by remember { mutableStateOf("") }
+    var imageUrl by remember { mutableStateOf("") }
     var err by remember { mutableStateOf("") }
     val scope = rememberCoroutineScope()
 
@@ -400,23 +513,42 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
         title = { Text("添加药品") },
         text = {
             Column(Modifier.verticalScroll(rememberScrollState())) {
-                OutlinedTextField(name, { name = it }, label = { Text("药品名称 *") }, singleLine = true)
-                OutlinedTextField(spec, { spec = it }, label = { Text("规格（如 0.25g×24片）") }, singleLine = true)
-                OutlinedTextField(expiry, { expiry = it }, label = { Text("有效期至（2026-12-31）") }, singleLine = true)
-                Row {
-                    OutlinedTextField(stock, { stock = it }, label = { Text("库存数量") }, modifier = Modifier.weight(1f), singleLine = true)
+                // 拍照录入
+                MedPhotoPicker(imageUrl.ifEmpty { null }, onPicked = { imageUrl = it }, onClear = { imageUrl = "" })
+                Spacer(Modifier.height(10.dp))
+                OutlinedTextField(name, { name = it }, label = { Text("药品名称 *") },
+                    modifier = Modifier.fillMaxWidth(), singleLine = true)
+                Spacer(Modifier.height(6.dp))
+                OutlinedTextField(spec, { spec = it }, label = { Text("规格（如 0.25g×24片）") },
+                    modifier = Modifier.fillMaxWidth(), singleLine = true)
+                Spacer(Modifier.height(6.dp))
+                OutlinedTextField(expiry, { expiry = it }, label = { Text("有效期至（2026-12-31）") },
+                    modifier = Modifier.fillMaxWidth(), singleLine = true)
+                Spacer(Modifier.height(6.dp))
+                Row(Modifier.fillMaxWidth()) {
+                    OutlinedTextField(stock, { stock = it }, label = { Text("库存数量") },
+                        modifier = Modifier.weight(1f), singleLine = true)
                     Spacer(Modifier.width(8.dp))
-                    OutlinedTextField(unit, { unit = it }, label = { Text("单位") }, modifier = Modifier.weight(1f), singleLine = true)
+                    OutlinedTextField(unit, { unit = it }, label = { Text("单位") },
+                        modifier = Modifier.weight(1f), singleLine = true)
                 }
-                Text("日用量（用于推算何时该开药）", fontSize = 13.sp, color = Gray, modifier = Modifier.padding(top = 6.dp))
-                Row {
-                    OutlinedTextField(dailyDose, { dailyDose = it }, label = { Text("每日用量") }, modifier = Modifier.weight(1f), singleLine = true)
+                Spacer(Modifier.height(8.dp))
+                Text("日用量（用于推算何时该开药）", fontSize = 13.sp, color = Gray)
+                Spacer(Modifier.height(2.dp))
+                Row(Modifier.fillMaxWidth()) {
+                    OutlinedTextField(dailyDose, { dailyDose = it }, label = { Text("每日用量") },
+                        modifier = Modifier.weight(1f), singleLine = true)
                     Spacer(Modifier.width(8.dp))
-                    OutlinedTextField(doseUnit, { doseUnit = it }, label = { Text("单位") }, modifier = Modifier.weight(1f), singleLine = true)
+                    OutlinedTextField(doseUnit, { doseUnit = it }, label = { Text("单位") },
+                        modifier = Modifier.weight(1f), singleLine = true)
                 }
-                OutlinedTextField(location, { location = it }, label = { Text("存放位置（如 客厅药箱）") }, singleLine = true)
-                OutlinedTextField(notes, { notes = it }, label = { Text("备注") }, singleLine = true)
-                if (err.isNotEmpty()) Text(err, color = Red, fontSize = 13.sp)
+                Spacer(Modifier.height(6.dp))
+                OutlinedTextField(location, { location = it }, label = { Text("存放位置（如 客厅药箱）") },
+                    modifier = Modifier.fillMaxWidth(), singleLine = true)
+                Spacer(Modifier.height(6.dp))
+                OutlinedTextField(notes, { notes = it }, label = { Text("备注") },
+                    modifier = Modifier.fillMaxWidth(), singleLine = true)
+                if (err.isNotEmpty()) { Spacer(Modifier.height(4.dp)); Text(err, color = Red, fontSize = 13.sp) }
             }
         },
         confirmButton = {
@@ -430,7 +562,7 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
                             .put("stock_qty", stock.toDoubleOrNull() ?: 0.0)
                             .put("unit", unit.trim()).put("daily_dose", dailyDose.toDoubleOrNull() ?: 0.0)
                             .put("dose_unit", doseUnit.trim()).put("location", location.trim())
-                            .put("notes", notes.trim())
+                            .put("notes", notes.trim()).put("image_url", imageUrl)
                         if (userId >= 0) body.put("user_id", userId)
                         ApiClient.post("/api/medicines", body)
                         onClose()
@@ -598,13 +730,19 @@ private fun AddPlanDialog(userId: Int, onClose: () -> Unit) {
                         }
                     }
                 }
+                Spacer(Modifier.height(8.dp))
+                Text("服药时间（逗号分隔，如 08:00,12:00,20:00）", fontSize = 13.sp, color = Gray)
                 OutlinedTextField(timesText, { timesText = it },
-                    label = { Text("服药时间（逗号分隔，如 08:00,12:00,20:00）") }, singleLine = true)
-                Row {
-                    OutlinedTextField(dose, { dose = it }, label = { Text("每次剂量") }, modifier = Modifier.weight(1f), singleLine = true)
+                    modifier = Modifier.fillMaxWidth(), singleLine = true)
+                Spacer(Modifier.height(8.dp))
+                Row(Modifier.fillMaxWidth()) {
+                    OutlinedTextField(dose, { dose = it }, label = { Text("每次剂量") },
+                        modifier = Modifier.weight(1f), singleLine = true)
                     Spacer(Modifier.width(8.dp))
-                    OutlinedTextField(doseUnit, { doseUnit = it }, label = { Text("单位") }, modifier = Modifier.weight(1f), singleLine = true)
+                    OutlinedTextField(doseUnit, { doseUnit = it }, label = { Text("单位") },
+                        modifier = Modifier.weight(1f), singleLine = true)
                 }
+                Spacer(Modifier.height(8.dp))
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     FilterChip(selected = !interval, onClick = { interval = false }, label = { Text("每天") })
                     Spacer(Modifier.width(8.dp))
@@ -612,12 +750,16 @@ private fun AddPlanDialog(userId: Int, onClose: () -> Unit) {
                     if (interval) {
                         Spacer(Modifier.width(8.dp))
                         OutlinedTextField(intervalDays, { intervalDays = it },
-                            label = { Text("N") }, modifier = Modifier.width(80.dp), singleLine = true)
+                            label = { Text("N 天") }, modifier = Modifier.width(90.dp), singleLine = true)
                     }
                 }
-                OutlinedTextField(start, { start = it }, label = { Text("开始日期（2026-10-17）") }, singleLine = true)
-                OutlinedTextField(end, { end = it }, label = { Text("结束日期（选填）") }, singleLine = true)
-                if (err.isNotEmpty()) Text(err, color = Red, fontSize = 13.sp)
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(start, { start = it }, label = { Text("开始日期（如 2026-10-17）") },
+                    modifier = Modifier.fillMaxWidth(), singleLine = true)
+                Spacer(Modifier.height(8.dp))
+                OutlinedTextField(end, { end = it }, label = { Text("结束日期（选填）") },
+                    modifier = Modifier.fillMaxWidth(), singleLine = true)
+                if (err.isNotEmpty()) { Spacer(Modifier.height(4.dp)); Text(err, color = Red, fontSize = 13.sp) }
             }
         },
         confirmButton = {
