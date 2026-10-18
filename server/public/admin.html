@@ -54,17 +54,19 @@ button.mini{width:auto;padding:5px 12px;font-size:13px;margin:0}
 <div id="app">
   <header>
     <b>家庭用药 · 管理后台</b>
-    <span class="u" id="huser"></span>
+    <span class="u"><span id="huser"></span> <a href="#" onclick="logout()" style="color:#fff;margin-left:14px;text-decoration:none">退出登录</a></span>
   </header>
   <main>
     <div class="tabs">
       <button class="act" onclick="tab(0,this)">成员总览</button>
       <button onclick="tab(1,this)">预警中心</button>
       <button onclick="tab(2,this)">邀请成员</button>
+      <button onclick="tab(3,this)">AI配置</button>
     </div>
     <div id="tab0"></div>
     <div id="tab1" style="display:none"></div>
     <div id="tab2" style="display:none"></div>
+    <div id="tab3" style="display:none"></div>
   </main>
 </div>
 <script>
@@ -88,7 +90,7 @@ async function init(){
   data=await api('/admin/overview');
   render();
 }
-function render(){renderOverview();renderAlerts();renderInvite();}
+function render(){renderOverview();renderAlerts();renderInvite();renderAiConfig();}
 function esc(n){return n}
 function tagFor(m){
   const t=[];
@@ -132,8 +134,62 @@ async function renewCode(){
 function tab(i,btn){
   document.querySelectorAll('.tabs button').forEach(b=>b.classList.remove('act'));
   btn.classList.add('act');
-  [0,1,2].forEach(k=>$('tab'+k).style.display=k===i?'':'none');
+  [0,1,2,3].forEach(k=>$('tab'+k).style.display=k===i?'':'none');
   if(i===0)init();
+}
+function logout(){T='';localStorage.removeItem('admin_token');location.href='/admin.html';}
+async function renderAiConfig(){
+  let cfg={provider:'',model:'',baseUrl:'',apiKey:'',baiduAk:'',baiduSk:''};
+  try{cfg=await api('/admin/ai-config');}catch(e){}
+  const showProvider=cfg.provider||'';
+  $('tab3').innerHTML=`
+  <div class="card"><h3>AI 视觉识别模型配置</h3>
+    <div class="sub" style="margin-bottom:12px">配置后，APP 拍照识别药品/处方将调用云端大模型；未配置时降级为本地 OCR。密钥加密存储，仅管理员可见。</div>
+    <label style="font-size:13px">模型服务商</label>
+    <select id="ai_provider" onchange="toggleAiFields()">
+      <option value="" ${!showProvider?'selected':''}>-- 未配置（仅本地OCR）--</option>
+      <option value="openai" ${showProvider==='openai'?'selected':''}>OpenAI 兼容（通义千问VL / DeepSeek-VL / GLM-4V / Kimi 等）</option>
+      <option value="baidu" ${showProvider==='baidu'?'selected':''}>百度文心 ERNIE-4.0</option>
+    </select>
+    <div id="ai_openai_fields" style="display:${showProvider==='openai'?'block':'none'}">
+      <label style="font-size:13px">API Key</label>
+      <input id="ai_apikey" placeholder="sk-xxxx" value="${h(cfg.apiKey)}">
+      <label style="font-size:13px">Base URL</label>
+      <input id="ai_baseurl" placeholder="https://dashscope.aliyuncs.com/compatible-mode/v1" value="${h(cfg.baseUrl)}">
+      <label style="font-size:13px">模型名</label>
+      <input id="ai_model" placeholder="qwen-vl-plus" value="${h(cfg.model)}">
+      <div class="sub" style="margin:6px 0">通义千问：base=https://dashscope.aliyuncs.com/compatible-mode/v1，model=qwen-vl-plus</div>
+    </div>
+    <div id="ai_baidu_fields" style="display:${showProvider==='baidu'?'block':'none'}">
+      <label style="font-size:13px">API Key</label>
+      <input id="ai_ak" placeholder="百度智能云 API Key" value="${h(cfg.baiduAk)}">
+      <label style="font-size:13px">Secret Key</label>
+      <input id="ai_sk" placeholder="百度智能云 Secret Key" value="${h(cfg.baiduSk)}">
+      <label style="font-size:13px">模型名（可选）</label>
+      <input id="ai_bmodel" placeholder="ernie-4.0-8k-preview" value="${h(cfg.model)}">
+    </div>
+    <div class="row">
+      <button class="mini" onclick="saveAiConfig()">保存配置</button>
+      <button class="mini" style="background:#64748b" onclick="renderAiConfig()">重置</button>
+      <span id="ai_msg" class="sub"></span>
+    </div>
+  </div>`;
+}
+function toggleAiFields(){
+  const p=$('ai_provider').value;
+  $('ai_openai_fields').style.display=p==='openai'?'block':'none';
+  $('ai_baidu_fields').style.display=p==='baidu'?'block':'none';
+}
+async function saveAiConfig(){
+  const p=$('ai_provider').value;
+  const body={provider:p};
+  if(p==='openai'){body.apiKey=$('ai_apikey').value;body.baseUrl=$('ai_baseurl').value;body.model=$('ai_model').value;}
+  if(p==='baidu'){body.baiduAk=$('ai_ak').value;body.baiduSk=$('ai_sk').value;body.model=$('ai_bmodel').value;}
+  try{
+    const r=await api('/admin/ai-config',{method:'POST',body:JSON.stringify(body)});
+    $('ai_msg').textContent='✓ 已保存，当前 provider: '+(r.provider||'未配置');
+    $('ai_msg').style.color='var(--ok)';
+  }catch(e){$('ai_msg').textContent='✗ '+e.message;$('ai_msg').style.color='var(--bad)';}
 }
 if(T)init();
 </script>

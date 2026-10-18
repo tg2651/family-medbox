@@ -14,6 +14,18 @@ db.exec('PRAGMA journal_mode = WAL');
 // 旧库兼容：补 image_url 列
 try { db.exec('ALTER TABLE medicines ADD COLUMN image_url TEXT DEFAULT \'\''); } catch (e) {}
 
+// 设置表（键值对）
+db.exec(`CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY,
+  value TEXT
+)`);
+
+// 启动时加载 AI 配置
+try {
+  const row = db.prepare('SELECT value FROM settings WHERE key = ?').get('ai_config');
+  if (row) ai.setRuntimeConfig(JSON.parse(row.value));
+} catch (e) {}
+
 // ---------- 工具 ----------
 function hashPwd(pw, salt) {
   salt = salt || crypto.randomBytes(16).toString('hex');
@@ -156,6 +168,8 @@ app.use((req, res, next) => {
   next();
 });
 app.use(express.static(path.join(__dirname, 'public')));
+// 后台快捷地址
+app.get('/admin', (req, res) => res.redirect('/admin.html'));
 // 上传的药品图片
 app.use('/uploads', express.static(path.join(DATA_DIR, 'uploads')));
 
@@ -428,6 +442,40 @@ app.get('/api/admin/overview', requireAuth, requireAdmin, (req, res) => {
   alerts.refill.sort((a, b) => a.days_left - b.days_left);
   alerts.expiry.sort((a, b) => a.days_left - b.days_left);
   res.json({ members: result, alerts });
+});
+
+// --- AI 模型配置（管理员） ---
+app.get('/api/admin/ai-config', requireAuth, requireAdmin, (req, res) => {
+  const cfg = ai.getCfg();
+  // 密钥脱敏：只返回是否已配置，不返回明文
+  const masked = {
+    provider: cfg.provider || '',
+    model: cfg.model || '',
+    baseUrl: cfg.baseUrl || '',
+    apiKey: cfg.apiKey ? '****' : '',
+    baiduAk: cfg.baiduAk ? '****' : '',
+    baiduSk: cfg.baiduSk ? '****' : '',
+    fromEnv: !ai.runtimeSet  // 标记是否来自环境变量
+  };
+  res.json(masked);
+});
+
+app.post('/api/admin/ai-config', requireAuth, requireAdmin, (req, res) => {
+  const { provider, apiKey, baseUrl, model, baiduAk, baiduSk } = req.body || {};
+  const cur = ai.getCfg();
+  const cfg = {
+    provider: (provider || '').toLowerCase(),
+    // 如果传 "****" 表示不修改，保留原值
+    apiKey: apiKey === '****' ? (cur.apiKey || '') : (apiKey || ''),
+    baseUrl: baseUrl || '',
+    model: model || '',
+    baiduAk: baiduAk === '****' ? (cur.baiduAk || '') : (baiduAk || ''),
+    baiduSk: baiduSk === '****' ? (cur.baiduSk || '') : (baiduSk || '')
+  };
+  db.prepare('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value')
+    .run('ai_config', JSON.stringify(cfg));
+  ai.setRuntimeConfig(cfg);
+  res.json({ ok: true, provider: cfg.provider });
 });
 
 const PORT = process.env.PORT || 3000;

@@ -23,14 +23,31 @@ const { URL } = require('url');
 
 const provider = (process.env.AI_PROVIDER || '').toLowerCase();
 
+// 运行时配置（由管理后台写入数据库后加载，优先级高于环境变量）
+let runtimeConfig = null;
+let runtimeSet = false;
+function getCfg() {
+  if (runtimeConfig) return runtimeConfig;
+  return {
+    provider: (process.env.AI_PROVIDER || '').toLowerCase(),
+    apiKey: process.env.AI_API_KEY || '',
+    baseUrl: process.env.AI_BASE_URL || '',
+    model: process.env.AI_MODEL || '',
+    baiduAk: process.env.BAIDU_API_KEY || '',
+    baiduSk: process.env.BAIDU_SECRET_KEY || ''
+  };
+}
+function setRuntimeConfig(cfg) { runtimeConfig = cfg; runtimeSet = true; baiduToken = ''; baiduTokenExpire = 0; }
+
 /* ---------------- 百度文心 ---------------- */
 let baiduToken = '';
 let baiduTokenExpire = 0;
 
 function baiduAccessToken() {
   return new Promise((resolve, reject) => {
-    const ak = process.env.BAIDU_API_KEY;
-    const sk = process.env.BAIDU_SECRET_KEY;
+    const cfg = getCfg();
+    const ak = cfg.baiduAk;
+    const sk = cfg.baiduSk;
     if (!ak || !sk) return reject(new Error('未配置 BAIDU_API_KEY / BAIDU_SECRET_KEY'));
     if (baiduToken && Date.now() < baiduTokenExpire) return resolve(baiduToken);
     const url = `/oauth/2.0/token?grant_type=client_credentials&client_id=${encodeURIComponent(ak)}&client_secret=${encodeURIComponent(sk)}`;
@@ -59,8 +76,9 @@ function baiduAccessToken() {
 function callBaidu(imageBase64, systemPrompt, userPrompt) {
   return new Promise(async (resolve, reject) => {
     try {
+      const cfg = getCfg();
       const token = await baiduAccessToken();
-      const model = process.env.AI_MODEL || 'ernie-4.0-8k-preview';
+      const model = cfg.model || 'ernie-4.0-8k-preview';
       const url = `/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/${model}?access_token=${token}`;
       const payload = JSON.stringify({
         system: systemPrompt,
@@ -94,9 +112,10 @@ function callBaidu(imageBase64, systemPrompt, userPrompt) {
 /* ---------------- OpenAI 兼容 ---------------- */
 function callOpenAI(imageBase64, systemPrompt, userPrompt) {
   return new Promise((resolve, reject) => {
-    const apiKey = process.env.AI_API_KEY;
-    const baseUrl = process.env.AI_BASE_URL;
-    const model = process.env.AI_MODEL;
+    const cfg = getCfg();
+    const apiKey = cfg.apiKey;
+    const baseUrl = cfg.baseUrl;
+    const model = cfg.model;
     if (!apiKey || !baseUrl || !model) return reject(new Error('未配置 AI_API_KEY / AI_BASE_URL / AI_MODEL'));
     const payload = JSON.stringify({
       model,
@@ -135,9 +154,10 @@ function callOpenAI(imageBase64, systemPrompt, userPrompt) {
 
 /* ---------------- 统一入口 ---------------- */
 function callAI(imageBase64, systemPrompt, userPrompt) {
-  if (provider === 'baidu') return callBaidu(imageBase64, systemPrompt, userPrompt);
-  if (provider === 'openai') return callOpenAI(imageBase64, systemPrompt, userPrompt);
-  return Promise.reject(new Error('AI 未配置：请在服务端设置 AI_PROVIDER 环境变量（openai 或 baidu）及对应密钥'));
+  const p = (getCfg().provider || '').toLowerCase();
+  if (p === 'baidu') return callBaidu(imageBase64, systemPrompt, userPrompt);
+  if (p === 'openai') return callOpenAI(imageBase64, systemPrompt, userPrompt);
+  return Promise.reject(new Error('AI 未配置：请在管理后台「AI配置」中选择模型并填入密钥'));
 }
 
 function extractJson(text) {
@@ -198,4 +218,4 @@ async function recognizePrescription(imageBase64) {
   };
 }
 
-module.exports = { recognizeMedicine, recognizePrescription, isConfigured: () => !!provider };
+module.exports = { recognizeMedicine, recognizePrescription, isConfigured: () => !!(getCfg().provider), setRuntimeConfig, getCfg, get runtimeSet(){return runtimeSet} };
