@@ -136,9 +136,10 @@ private fun MedPhotoPicker(imageUrl: String?, onResult: (imageUrl: String, ocr: 
                         val aiName = r.optString("name")
                         val aiSpec = r.optString("spec")
                         val aiExpiry = r.optString("expiry_date")
+                        val aiApn = r.optString("approval_number")
                         val aiRaw = r.optString("raw")
-                        if (aiName.isNotEmpty() || aiSpec.isNotEmpty() || aiExpiry.isNotEmpty()) {
-                            ocr = MedOcrResult(name = aiName, spec = aiSpec, expiry = aiExpiry, rawText = aiRaw)
+                        if (aiName.isNotEmpty() || aiSpec.isNotEmpty() || aiExpiry.isNotEmpty() || aiApn.isNotEmpty()) {
+                            ocr = MedOcrResult(name = aiName, spec = aiSpec, expiry = aiExpiry, approval = aiApn, rawText = aiRaw)
                             source = "AI"
                         } else if (aiRaw.isNotBlank()) {
                             // AI 返回了文本但未结构化 → 用本地解析器兜底
@@ -615,6 +616,7 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
                             if (name.isBlank() && p.name.isNotEmpty()) { name = p.name; filled.add("名称") }
                             if (spec.isBlank() && p.spec.isNotEmpty()) { spec = p.spec; filled.add("规格") }
                             if (expiry.isBlank() && p.expiry.isNotEmpty()) { expiry = p.expiry; filled.add("有效期") }
+                            if (approvalNo.isBlank() && p.approval.isNotEmpty()) { approvalNo = p.approval; filled.add("批准文号") }
                             ocrHint = if (filled.isNotEmpty())
                                 "已识别（$source）：${filled.joinToString("、")}（请核对）"
                             else

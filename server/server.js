@@ -295,22 +295,32 @@ app.post('/api/ai/recognize', requireAuth, async (req, res) => {
   } catch (e) { bad(res, e.message || 'AI识别失败'); }
 });
 
-// 名称匹配本地药品库，补全规格/厂家/批准文号（不覆盖 AI 已识别内容）
+// 匹配本地药品库，补全规格/厂家/批准文号（不覆盖 AI 已识别内容）
+// 匹配优先级：批准文号精确匹配（唯一权威键，走索引）> 名称精确 > 名称前缀 > 反向前缀
 function enrichFromCatalog(r) {
-  if (!r || !r.name) return r;
-  const q = String(r.name).trim();
-  if (q.length < 2) return r;
+  if (!r) return r;
+  // 规范化批准文号字段（AI 返回 approval_number）
+  const apn = String(r.approval_no || r.approval_number || '').trim().toUpperCase().replace(/\s/g, '');
+  if (apn) r.approval_no = apn;
   let hit = null;
   try {
-    hit = db.prepare("SELECT * FROM drug_catalog WHERE name=? AND spec!='' LIMIT 1").get(q);
-    if (!hit) hit = db.prepare("SELECT * FROM drug_catalog WHERE name LIKE ? AND spec!='' LIMIT 1").get(q + '%');
-    if (!hit) hit = db.prepare("SELECT * FROM drug_catalog WHERE ? LIKE name || '%' AND spec!='' LIMIT 1").get(q);
+    if (apn) hit = db.prepare('SELECT * FROM drug_catalog WHERE approval_no=? LIMIT 1').get(apn);
+    if (!hit && r.name) {
+      const q = String(r.name).trim();
+      if (q.length >= 2) {
+        hit = db.prepare("SELECT * FROM drug_catalog WHERE name=? AND spec!='' LIMIT 1").get(q);
+        if (!hit) hit = db.prepare("SELECT * FROM drug_catalog WHERE name LIKE ? AND spec!='' LIMIT 1").get(q + '%');
+        if (!hit) hit = db.prepare("SELECT * FROM drug_catalog WHERE ? LIKE name || '%' AND spec!='' LIMIT 1").get(q);
+      }
+    }
   } catch (e) { return r; }
   if (!hit) return r;
+  if (!r.name && hit.name) r.name = hit.name;
   if (!r.spec && hit.spec) r.spec = hit.spec;
   if (!r.manufacturer && hit.manufacturer) r.manufacturer = hit.manufacturer;
   if (!r.approval_no && hit.approval_no) r.approval_no = hit.approval_no;
   if (!r.raw) r.raw = hit.name + '（' + hit.approval_no + '）';
+  r.catalog_matched = true;
   return r;
 }
 

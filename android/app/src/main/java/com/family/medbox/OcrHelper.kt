@@ -17,6 +17,7 @@ data class MedOcrResult(
     val name: String = "",
     val spec: String = "",
     val expiry: String = "",
+    val approval: String = "",
     val rawText: String = ""
 )
 
@@ -85,6 +86,8 @@ object OcrHelper {
         val specRegex = Regex("""(\d+(?:\.\d+)?\s*(?:mg|g|ml|μg|ug|IU|单位)\s*[×xX\*]\s*\d+\s*[片粒胶囊袋支瓶丸滴]?)""")
         // 有效期至：2026-12-31 / 2026.12 / 2026年12月31日
         val expiryRegex = Regex("""(?:有效期至|失效期|有效期[:：]?|EXP[:：.]?\s*)(\d{4})[-/年.](\d{1,2})(?:[-/月.](\d{1,2}))?""")
+        // 批准文号：国药准字H20084558（OCR 可能插入空格，宽松匹配后去空格）
+        val apnRegex = Regex("""国药准[字号]\s*[A-Z]\s*\d{6,8}|国药试字\s*[A-Z]\s*\d{6,8}""")
         // 药品名特征行：含 片/胶囊/颗粒/口服液/注射液/丸/膏/散/糖浆/滴丸 且不含说明书常用词
         val nameSuffix = Regex("""[一-龥A-Za-z（）()·]+(片|胶囊|颗粒|口服液|注射液|注射用[一-龥]+|丸|膏|散|糖浆|滴丸|缓释片|肠溶片|分散片|泡腾片|气雾剂|喷雾剂|滴眼液|滴鼻液|洗剂|搽剂|酊剂|乳膏|软膏|凝胶|贴膏|栓剂)""")
         val nameBlacklist = Regex("""(说明书|请仔细阅读|禁忌|不良反应|注意事项|用法用量|成份|性状|贮藏|包装|批准文号|生产企业|执行标准|功能主治|适应症|规格|有效期|生产日期|产品批号|药师|处方|本品|药物)""")
@@ -92,8 +95,12 @@ object OcrHelper {
         var spec = ""
         var expiry = ""
         var name = ""
+        var apn = ""
 
         for (line in lines) {
+            if (apn.isEmpty()) {
+                apnRegex.find(line)?.let { apn = it.value.replace(Regex("\\s"), "") }
+            }
             if (spec.isEmpty()) {
                 specRegex.find(line)?.let { spec = it.value.replace(" ", "") }
             }
@@ -113,7 +120,7 @@ object OcrHelper {
         if (name.isEmpty()) {
             name = lines.firstOrNull { it.length in 4..24 && !nameBlacklist.containsMatchIn(it) && !it.any { c -> c.isDigit() } } ?: ""
         }
-        return r.copy(name = name, spec = spec, expiry = expiry)
+        return r.copy(name = name, spec = spec, expiry = expiry, approval = apn)
     }
 
     /** 解析处方文字，提取药名与用法用量 */
