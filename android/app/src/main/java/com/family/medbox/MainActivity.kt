@@ -31,6 +31,7 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Medication
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Schedule
+import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Today
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -534,10 +535,65 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
     var location by remember { mutableStateOf("") }
     var notes by remember { mutableStateOf("") }
     var imageUrl by remember { mutableStateOf("") }
+    var manufacturer by remember { mutableStateOf("") }
+    var barcode by remember { mutableStateOf("") }
+    var barcodeHint by remember { mutableStateOf("") }
+    var bcBusy by remember { mutableStateOf(false) }
+    var bcPhotoUri by remember { mutableStateOf<Uri?>(null) }
     var ocrHint by remember { mutableStateOf("") }
     var err by remember { mutableStateOf("") }
     val scope = rememberCoroutineScope()
     val ctx = LocalContext.current
+
+    // 扫商品条码（EAN-13）→ 本地家庭库/公开条码库查询 → 自动填充
+    val bcCamLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
+        if (ok && bcPhotoUri != null) {
+            scope.launch {
+                bcBusy = true; barcodeHint = ""
+                try {
+                    val code = OcrHelper.scanBarcode(ctx, bcPhotoUri!!)
+                    if (code.length in 8..14) {
+                        barcode = code
+                        barcodeHint = "条码：$code，查询中…"
+                        val r = ApiClient.get("/api/medicine/barcode/$code") as JSONObject
+                        val filled = mutableListOf<String>()
+                        when (r.optString("found")) {
+                            "local" -> {
+                                val m = r.optJSONObject("medicine")
+                                if (m != null) {
+                                    if (name.isBlank() && m.optString("name").isNotEmpty()) { name = m.optString("name"); filled.add("名称") }
+                                    if (spec.isBlank() && m.optString("spec").isNotEmpty()) { spec = m.optString("spec"); filled.add("规格") }
+                                    if (expiry.isBlank() && m.optString("expiry_date").isNotEmpty()) { expiry = m.optString("expiry_date"); filled.add("有效期") }
+                                    if (manufacturer.isBlank() && m.optString("manufacturer").isNotEmpty()) { manufacturer = m.optString("manufacturer"); filled.add("厂家") }
+                                    if (dailyDose.isBlank() && m.optDouble("daily_dose") > 0) { dailyDose = fmtNum(m.optDouble("daily_dose")); filled.add("日用量") }
+                                    if (doseUnit.isBlank() || doseUnit == "片") { val du = m.optString("dose_unit"); if (du.isNotEmpty()) { doseUnit = du; filled.add("剂量单位") } }
+                                    if (m.optString("image_url").isNotEmpty() && imageUrl.isEmpty()) imageUrl = m.optString("image_url")
+                                    barcodeHint = "已匹配家庭药箱记录：${filled.joinToString("、")}（请核对）"
+                                }
+                            }
+                            "online" -> {
+                                val d = r.optJSONObject("data")
+                                if (d != null) {
+                                    if (name.isBlank() && d.optString("name").isNotEmpty()) { name = d.optString("name"); filled.add("名称") }
+                                    if (spec.isBlank() && d.optString("spec").isNotEmpty()) { spec = d.optString("spec"); filled.add("规格") }
+                                    if (manufacturer.isBlank() && d.optString("manufacturer").isNotEmpty()) { manufacturer = d.optString("manufacturer"); filled.add("厂家") }
+                                    barcodeHint = if (filled.isNotEmpty()) "公开条码库匹配：${filled.joinToString("、")}（请核对，未识别的字段可拍照识别补充）"
+                                                  else "公开条码库返回：${d.optString("raw_title")}（请核对）"
+                                }
+                            }
+                            else -> barcodeHint = "条码已记录保存。${r.optString("message")}；建议用「拍照录入」AI 识别药盒补充信息，保存后全家扫码即可秒出全部信息"
+                        }
+                    } else {
+                        barcodeHint = "未识别到商品条码，请对准药盒侧面的条形码重新扫描"
+                    }
+                } catch (e: Exception) { barcodeHint = "扫码失败：${e.message}" }
+                bcBusy = false
+            }
+        }
+    }
+    val bcPermLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
+        if (it) { val u = newPhotoUri(ctx); bcPhotoUri = u; bcCamLauncher.launch(u) }
+    }
 
     AlertDialog(
         onDismissRequest = onClose,
@@ -566,11 +622,32 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
                     onClear = { imageUrl = "" }
                 )
                 if (ocrHint.isNotEmpty()) Text(ocrHint, fontSize = 12.sp, color = Gray, modifier = Modifier.padding(top = 4.dp))
+                Spacer(Modifier.height(8.dp))
+                // 扫商品条码（EAN-13）自动录入
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    OutlinedButton(onClick = {
+                        if (ContextCompat.checkSelfPermission(ctx, android.Manifest.permission.CAMERA) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                            val u = newPhotoUri(ctx); bcPhotoUri = u; bcCamLauncher.launch(u)
+                        } else bcPermLauncher.launch(android.Manifest.permission.CAMERA)
+                    }, enabled = !bcBusy) {
+                        Icon(Icons.Filled.Search, null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text(if (bcBusy) "扫码查询中…" else "扫条码录入")
+                    }
+                    if (barcode.isNotEmpty()) {
+                        Spacer(Modifier.width(8.dp))
+                        Text(barcode, fontSize = 12.sp, color = Blue)
+                    }
+                }
+                if (barcodeHint.isNotEmpty()) Text(barcodeHint, fontSize = 12.sp, color = Gray, modifier = Modifier.padding(top = 4.dp))
                 Spacer(Modifier.height(10.dp))
                 OutlinedTextField(name, { name = it }, label = { Text("药品名称 *") },
                     modifier = Modifier.fillMaxWidth(), singleLine = true)
                 Spacer(Modifier.height(6.dp))
                 OutlinedTextField(spec, { spec = it }, label = { Text("规格（如 0.25g×24片）") },
+                    modifier = Modifier.fillMaxWidth(), singleLine = true)
+                Spacer(Modifier.height(6.dp))
+                OutlinedTextField(manufacturer, { manufacturer = it }, label = { Text("生产厂家（选填）") },
                     modifier = Modifier.fillMaxWidth(), singleLine = true)
                 Spacer(Modifier.height(6.dp))
                 OutlinedTextField(expiry, { expiry = it }, label = { Text("有效期至（2026-12-31）") },
@@ -614,6 +691,7 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
                             .put("unit", unit.trim()).put("daily_dose", dailyDose.toDoubleOrNull() ?: 0.0)
                             .put("dose_unit", doseUnit.trim()).put("location", location.trim())
                             .put("notes", notes.trim()).put("image_url", imageUrl)
+                            .put("barcode", barcode).put("manufacturer", manufacturer.trim())
                         if (userId >= 0) body.put("user_id", userId)
                         ApiClient.post("/api/medicines", body)
                         onClose()

@@ -4,6 +4,7 @@ const { DatabaseSync } = require('node:sqlite');
 const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
+const https = require('https');
 const ai = require('./aiRecognize');
 
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
@@ -13,6 +14,8 @@ const db = new DatabaseSync(path.join(DATA_DIR, 'medbox.db'));
 db.exec('PRAGMA journal_mode = WAL');
 // 旧库兼容：补 image_url 列
 try { db.exec('ALTER TABLE medicines ADD COLUMN image_url TEXT DEFAULT \'\''); } catch (e) {}
+try { db.exec('ALTER TABLE medicines ADD COLUMN barcode TEXT DEFAULT \'\''); } catch (e) {}
+try { db.exec('ALTER TABLE medicines ADD COLUMN manufacturer TEXT DEFAULT \'\''); } catch (e) {}
 
 // 设置表（键值对）
 db.exec(`CREATE TABLE IF NOT EXISTS settings (
@@ -93,6 +96,8 @@ CREATE TABLE IF NOT EXISTS medicines(
   location TEXT DEFAULT '',
   notes TEXT DEFAULT '',
   image_url TEXT DEFAULT '',
+  barcode TEXT DEFAULT '',
+  manufacturer TEXT DEFAULT '',
   created_at TEXT DEFAULT (datetime('now','localtime'))
 );
 CREATE TABLE IF NOT EXISTS schedules(
@@ -271,14 +276,100 @@ app.post('/api/ai/recognize', requireAuth, async (req, res) => {
   } catch (e) { bad(res, e.message || 'AI识别失败'); }
 });
 
+// --- 药品条码（EAN-13等）查询 ---
+// 查询顺序：1) 本家庭已录入的相同条码药品  2) 后台配置的自定义接口（可选）  3) UPCItemDB（免费无key）  4) OpenProductsFacts（免费无key）
+function httpGetJson(url, headers = {}, timeoutMs = 8000) {
+  return new Promise((resolve, reject) => {
+    const u = new URL(url);
+    const lib = u.protocol === 'http:' ? require('http') : https;
+    const rq = lib.request({ hostname: u.hostname, port: u.port, path: u.pathname + u.search, method: 'GET',
+      headers: { 'Accept': 'application/json', 'User-Agent': 'FamilyMedbox/1.0', ...headers } }, (resp) => {
+      if (resp.statusCode >= 300 && resp.statusCode < 400 && resp.headers.location) {
+        // 跟随一次重定向
+        const loc = new URL(resp.headers.location, u).toString();
+        resp.resume();
+        httpGetJson(loc, headers, timeoutMs).then(resolve, reject);
+        return;
+      }
+      let body = ''; resp.on('data', d => body += d);
+      resp.on('end', () => { try { resolve(JSON.parse(body)); } catch (e) { reject(new Error('响应不是有效JSON')); } });
+    });
+    rq.on('error', reject); rq.setTimeout(timeoutMs, () => rq.destroy(new Error('查询超时'))); rq.end();
+  });
+}
+
+// 各在线条码源解析为统一结构 {name, spec, manufacturer, raw_title}
+function parseUpcItemDb(d) {
+  if (!d || d.code !== 'OK' || !Array.isArray(d.items) || !d.items.length) return null;
+  const it = d.items[0];
+  const title = (it.title || '').trim();
+  const specM = title.match(/(\d+(?:\.\d+)?\s*(?:mg|g|ml|μg|ug|IU)\s*[×xX\*]\s*\d+\s*[片粒贴袋支瓶丸枚袋]?|\d+(?:\.\d+)?\s*(?:mg|g|ml|μg|ug|IU))/i);
+  let name = title, spec = '';
+  if (specM) { spec = specM[1].replace(/\s+/g, ''); name = title.replace(specM[0], '').replace(/[|｜·\-—_\s]+$/g, '').trim(); }
+  return { name, spec, manufacturer: it.manufacturer || it.brand || '', raw_title: title, source: 'UPCItemDB' };
+}
+function parseOpenProductsFacts(d) {
+  if (!d || d.status !== 1 || !d.product) return null;
+  const p = d.product;
+  return {
+    name: (p.product_name || '').trim(),
+    spec: (p.quantity || '').trim(),
+    manufacturer: (p.brands || '').trim(),
+    raw_title: [p.product_name, p.quantity].filter(Boolean).join(' '),
+    source: 'OpenProductsFacts'
+  };
+}
+
+app.get('/api/medicine/barcode/:code', requireAuth, async (req, res) => {
+  const code = (req.params.code || '').trim();
+  if (!/^\d{8,14}$/.test(code)) return bad(res, '条码格式不正确（应为8-14位数字）');
+  // 1) 本地家庭药品库：信息最全（含日用量、照片），直接整体复用
+  const local = db.prepare('SELECT * FROM medicines WHERE family_id=? AND barcode=? ORDER BY id DESC LIMIT 1')
+    .get(req.user.family_id, code);
+  if (local) return res.json({ found: 'local', code, medicine: local });
+  // 2) 后台自定义查询接口（可选，模板 {code} 占位）
+  let customUrl = '';
+  try { const r = db.prepare('SELECT value FROM settings WHERE key=?').get('barcode_lookup_url'); if (r) customUrl = JSON.parse(r.value).url || ''; } catch (e) {}
+  const tried = [];
+  if (customUrl) {
+    try {
+      const d = await httpGetJson(customUrl.replace('{code}', encodeURIComponent(code)));
+      const it = d && (d.items && d.items[0] ? d.items[0] : (d.data || d.product || d));
+      const name = (it && (it.name || it.product_name || it.title || it.goodsName || it.药品名称)) || '';
+      if (name) {
+        return res.json({ found: 'online', code, data: {
+          name: String(name), spec: String(it.spec || it.specification || it.specName || ''),
+          manufacturer: String(it.manufacturer || it.producer || it.vendor || ''),
+          raw_title: String(name), source: '自定义接口' } });
+      }
+      tried.push('自定义接口无数据');
+    } catch (e) { tried.push('自定义接口失败'); }
+  }
+  // 3) UPCItemDB（国内服务器可能不可达，失败自动跳过）
+  try {
+    const d = await httpGetJson(`https://api.upcitemdb.com/prod/trial/lookup?upc=${encodeURIComponent(code)}`);
+    const parsed = parseUpcItemDb(d);
+    if (parsed) return res.json({ found: 'online', code, data: parsed });
+    tried.push('UPCItemDB无数据');
+  } catch (e) { tried.push('UPCItemDB不可达'); }
+  // 4) OpenProductsFacts
+  try {
+    const d = await httpGetJson(`https://world.openproductsfacts.org/api/v0/product/${encodeURIComponent(code)}.json`);
+    const parsed = parseOpenProductsFacts(d);
+    if (parsed && parsed.name) return res.json({ found: 'online', code, data: parsed });
+    tried.push('OpenProductsFacts无数据');
+  } catch (e) { tried.push('OpenProductsFacts不可达'); }
+  res.json({ found: false, code, message: '各公开条码库均未收录（' + tried.join('，') + '）' });
+});
+
 app.post('/api/medicines', requireAuth, (req, res) => {
-  const { name, spec, category, expiry_date, stock_qty, unit, daily_dose, dose_unit, location, notes, image_url } = req.body;
+  const { name, spec, category, expiry_date, stock_qty, unit, daily_dose, dose_unit, location, notes, image_url, barcode, manufacturer } = req.body;
   if (!name) return bad(res, '药品名称必填');
   let uid = req.user.id;
   if (req.body.user_id && req.user.role === 'admin') uid = +req.body.user_id;
-  const info = db.prepare(`INSERT INTO medicines(family_id,user_id,name,spec,category,expiry_date,stock_qty,unit,daily_dose,dose_unit,location,notes,image_url)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(req.user.family_id, uid, name, spec || '', category || '', expiry_date || '', +stock_qty || 0, unit || '盒', +daily_dose || 0, dose_unit || '片', location || '', notes || '', image_url || '');
+  const info = db.prepare(`INSERT INTO medicines(family_id,user_id,name,spec,category,expiry_date,stock_qty,unit,daily_dose,dose_unit,location,notes,image_url,barcode,manufacturer)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(req.user.family_id, uid, name, spec || '', category || '', expiry_date || '', +stock_qty || 0, unit || '盒', +daily_dose || 0, dose_unit || '片', location || '', notes || '', image_url || '', barcode || '', manufacturer || '');
   res.json({ id: Number(info.lastInsertRowid) });
 });
 
@@ -286,7 +377,7 @@ app.patch('/api/medicines/:id', requireAuth, (req, res) => {
   const m = db.prepare('SELECT * FROM medicines WHERE id=?').get(req.params.id);
   if (!m || m.family_id !== req.user.family_id) return bad(res, '药品不存在');
   if (m.user_id !== req.user.id && req.user.role !== 'admin') return bad(res, '无权限');
-  const f = ['name', 'spec', 'category', 'expiry_date', 'stock_qty', 'unit', 'daily_dose', 'dose_unit', 'location', 'notes', 'image_url'];
+  const f = ['name', 'spec', 'category', 'expiry_date', 'stock_qty', 'unit', 'daily_dose', 'dose_unit', 'location', 'notes', 'image_url', 'barcode', 'manufacturer'];
   const sets = [], vals = [];
   for (const k of f) if (req.body[k] !== undefined) { sets.push(`${k}=?`); vals.push(req.body[k]); }
   if (sets.length) db.prepare(`UPDATE medicines SET ${sets.join(',')} WHERE id=?`).run(...vals, m.id);
@@ -447,6 +538,8 @@ app.get('/api/admin/overview', requireAuth, requireAdmin, (req, res) => {
 // --- AI 模型配置（管理员） ---
 app.get('/api/admin/ai-config', requireAuth, requireAdmin, (req, res) => {
   const cfg = ai.getCfg();
+  let barcodeLookupUrl = '';
+  try { const r = db.prepare('SELECT value FROM settings WHERE key=?').get('barcode_lookup_url'); if (r) barcodeLookupUrl = JSON.parse(r.value).url || ''; } catch (e) {}
   const masked = {
     provider: cfg.provider || '',
     model: cfg.model || '',
@@ -454,13 +547,14 @@ app.get('/api/admin/ai-config', requireAuth, requireAdmin, (req, res) => {
     apiKey: cfg.apiKey ? '****' : '',
     baiduAk: cfg.baiduAk ? '****' : '',
     baiduSk: cfg.baiduSk ? '****' : '',
-    fromEnv: !ai.runtimeSet
+    fromEnv: !ai.runtimeSet,
+    barcodeLookupUrl
   };
   res.json(masked);
 });
 
 app.post('/api/admin/ai-config', requireAuth, requireAdmin, (req, res) => {
-  const { provider, apiKey, baseUrl, model, baiduAk, baiduSk } = req.body || {};
+  const { provider, apiKey, baseUrl, model, baiduAk, baiduSk, barcodeLookupUrl } = req.body || {};
   const cur = ai.getCfg();
   const cfg = {
     provider: (provider || '').toLowerCase(),
@@ -472,6 +566,10 @@ app.post('/api/admin/ai-config', requireAuth, requireAdmin, (req, res) => {
   };
   db.prepare('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value')
     .run('ai_config', JSON.stringify(cfg));
+  if (barcodeLookupUrl !== undefined) {
+    db.prepare('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value')
+      .run('barcode_lookup_url', JSON.stringify({ url: barcodeLookupUrl || '' }));
+  }
   ai.setRuntimeConfig(cfg);
   res.json({ ok: true, provider: cfg.provider });
 });

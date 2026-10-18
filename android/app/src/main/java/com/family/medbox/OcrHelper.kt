@@ -2,6 +2,9 @@ package com.family.medbox
 
 import android.content.Context
 import android.net.Uri
+import com.google.mlkit.vision.barcode.BarcodeScannerOptions
+import com.google.mlkit.vision.barcode.BarcodeScanning
+import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
@@ -37,6 +40,27 @@ object OcrHelper {
             val image = InputImage.fromFilePath(ctx, uri)
             recognizer.process(image)
                 .addOnSuccessListener { cont.resume(it.text) }
+                .addOnFailureListener { cont.resumeWithException(it) }
+        } catch (e: Exception) {
+            cont.resumeWithException(e)
+        }
+    }
+
+    /** 扫描药品外包装商品条码（EAN-13/EAN-8/UPC），返回纯数字码 */
+    suspend fun scanBarcode(ctx: Context, uri: Uri): String = suspendCancellableCoroutine { cont ->
+        try {
+            val image = InputImage.fromFilePath(ctx, uri)
+            val options = BarcodeScannerOptions.Builder()
+                .setBarcodeFormats(
+                    Barcode.FORMAT_EAN_13, Barcode.FORMAT_EAN_8,
+                    Barcode.FORMAT_UPC_A, Barcode.FORMAT_UPC_E
+                )
+                .build()
+            BarcodeScanning.getClient(options).process(image)
+                .addOnSuccessListener { barcodes ->
+                    val code = barcodes.firstOrNull()?.rawValue ?: ""
+                    cont.resume(code.replace(Regex("\\D"), ""))
+                }
                 .addOnFailureListener { cont.resumeWithException(it) }
         } catch (e: Exception) {
             cont.resumeWithException(e)
