@@ -2,6 +2,7 @@ package com.family.medbox
 
 import android.content.Context
 import android.net.Uri
+import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.chinese.ChineseTextRecognizerOptions
@@ -37,6 +38,20 @@ object OcrHelper {
             val image = InputImage.fromFilePath(ctx, uri)
             recognizer.process(image)
                 .addOnSuccessListener { cont.resume(it.text) }
+                .addOnFailureListener { cont.resumeWithException(it) }
+        } catch (e: Exception) {
+            cont.resumeWithException(e)
+        }
+    }
+
+    /** 扫描图片中的条码/二维码，返回第一个识别到的内容（追溯码通常为20位数字） */
+    suspend fun scanBarcode(ctx: Context, uri: Uri): String = suspendCancellableCoroutine { cont ->
+        try {
+            val image = InputImage.fromFilePath(ctx, uri)
+            BarcodeScanning.getClient().process(image)
+                .addOnSuccessListener { barcodes ->
+                    cont.resume(barcodes.firstOrNull()?.rawValue ?: "")
+                }
                 .addOnFailureListener { cont.resumeWithException(it) }
         } catch (e: Exception) {
             cont.resumeWithException(e)
