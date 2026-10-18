@@ -170,9 +170,11 @@ async function renderAiConfig(){
     </div>
     <div class="row">
       <button class="mini" onclick="saveAiConfig()">保存配置</button>
+      <button class="mini" style="background:#16a34a" onclick="testAi()">测试连接</button>
       <button class="mini" style="background:#64748b" onclick="renderAiConfig()">重置</button>
       <span id="ai_msg" class="sub"></span>
     </div>
+    <div id="ai_test_result" class="sub" style="margin-top:10px"></div>
   </div>`;
 }
 function toggleAiFields(){
@@ -190,6 +192,21 @@ async function saveAiConfig(){
     $('ai_msg').textContent='✓ 已保存，当前 provider: '+(r.provider||'未配置');
     $('ai_msg').style.color='var(--ok)';
   }catch(e){$('ai_msg').textContent='✗ '+e.message;$('ai_msg').style.color='var(--bad)';}
+}
+async function testAi(){
+  const el=$('ai_test_result');
+  el.style.color='';
+  el.textContent='正在测试…';
+  try{
+    const r=await api('/admin/ai-test',{method:'POST',body:JSON.stringify({})});
+    if(r.ok){
+      el.innerHTML='<span style="color:var(--ok)">✓ 连接成功</span> · 模型：'+h(r.model||'')+' · 耗时：'+(r.latency_ms||0)+'ms<br>模型回复：'+h(r.response||'');
+    }else{
+      el.innerHTML='<span style="color:var(--bad)">✗ 连接失败</span>：'+h(r.error||'未知错误')+'（耗时 '+(r.latency_ms||0)+'ms）';
+    }
+  }catch(e){
+    el.innerHTML='<span style="color:var(--bad)">✗ 测试请求失败</span>：'+h(e.message);
+  }
 }
 if(T)init();
 </script>

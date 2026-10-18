@@ -80,12 +80,12 @@ function callBaidu(imageBase64, systemPrompt, userPrompt) {
       const token = await baiduAccessToken();
       const model = cfg.model || 'ernie-4.0-8k-preview';
       const url = `/rpc/2.0/ai_custom/v1/wenxinworkshop/chat/${model}?access_token=${token}`;
+      const content = imageBase64
+        ? [{ type: 'text', text: userPrompt }, { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imageBase64}` } }]
+        : userPrompt;
       const payload = JSON.stringify({
         system: systemPrompt,
-        messages: [{ role: 'user', content: [
-          { type: 'text', text: userPrompt },
-          { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imageBase64}` } }
-        ]}]
+        messages: [{ role: 'user', content }]
       });
       const req = https.request(
         { hostname: 'aip.baidubce.com', path: url, method: 'POST',
@@ -117,18 +117,18 @@ function callOpenAI(imageBase64, systemPrompt, userPrompt) {
     const baseUrl = cfg.baseUrl;
     const model = cfg.model;
     if (!apiKey || !baseUrl || !model) return reject(new Error('未配置 AI_API_KEY / AI_BASE_URL / AI_MODEL'));
-    const payload = JSON.stringify({
-      model,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: [
-          { type: 'text', text: userPrompt },
-          { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imageBase64}` } }
-        ]}
-      ],
-      temperature: 0.2
-    });
     const u = new URL(baseUrl.replace(/\/$/, '') + '/chat/completions');
+    const messages = [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: imageBase64
+        ? [
+            { type: 'text', text: userPrompt },
+            { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${imageBase64}` } }
+          ]
+        : userPrompt
+      }
+    ];
+    const payload = JSON.stringify({ model, messages, temperature: 0.2 });
     const lib = u.protocol === 'http:' ? http : https;
     const req = lib.request(
       { hostname: u.hostname, port: u.port || (u.protocol === 'http:' ? 80 : 443), path: u.pathname + u.search, method: 'POST',
@@ -164,6 +164,27 @@ function extractJson(text) {
   const m = text.match(/\{[\s\S]*\}/);
   if (!m) return null;
   try { return JSON.parse(m[0]); } catch (e) { return null; }
+}
+
+/**
+ * 连通性测试：用当前配置发送一个最小文本请求，验证 endpoint / 鉴权 / 模型是否可用
+ * 返回 { ok, latency_ms, model, response, error }
+ */
+function testConnection() {
+  return new Promise(async (resolve) => {
+    const start = Date.now();
+    const cfg = getCfg();
+    const p = (cfg.provider || '').toLowerCase();
+    if (!p) return resolve({ ok: false, error: '未选择模型服务商' });
+    const system = '你是一个连通性测试助手。';
+    const user = '请只回复"pong"。';
+    try {
+      const text = await callAI(null, system, user);
+      resolve({ ok: true, latency_ms: Date.now() - start, model: cfg.model, response: (text || '').slice(0, 200) });
+    } catch (e) {
+      resolve({ ok: false, error: e.message || String(e), latency_ms: Date.now() - start });
+    }
+  });
 }
 
 async function recognizeMedicine(imageBase64) {
@@ -218,4 +239,4 @@ async function recognizePrescription(imageBase64) {
   };
 }
 
-module.exports = { recognizeMedicine, recognizePrescription, isConfigured: () => !!(getCfg().provider), setRuntimeConfig, getCfg, get runtimeSet(){return runtimeSet} };
+module.exports = { recognizeMedicine, recognizePrescription, isConfigured: () => !!(getCfg().provider), setRuntimeConfig, getCfg, get runtimeSet(){return runtimeSet}, testConnection };

@@ -478,5 +478,15 @@ app.post('/api/admin/ai-config', requireAuth, requireAdmin, (req, res) => {
   res.json({ ok: true, provider: cfg.provider });
 });
 
+// --- AI 连通性测试 ---
+app.post('/api/admin/ai-test', requireAuth, requireAdmin, async (req, res) => {
+  try {
+    const result = await ai.testConnection();
+    res.json(result);
+  } catch (e) {
+    res.json({ ok: false, error: e.message || String(e) });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, '0.0.0.0', () => console.log(`家庭用药服务已启动: http://0.0.0.0:${PORT}  (后台: /admin.html)`));
