@@ -582,6 +582,11 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
                                     if (spec.isBlank() && d.optString("spec").isNotEmpty()) { spec = d.optString("spec"); filled.add("规格") }
                                     if (manufacturer.isBlank() && d.optString("manufacturer").isNotEmpty()) { manufacturer = d.optString("manufacturer"); filled.add("厂家") }
                                     if (approvalNo.isBlank() && d.optString("approval_no").isNotEmpty()) { approvalNo = d.optString("approval_no"); filled.add("批准文号") }
+                                    // 根据权威库规格自动推断日用量单位
+                                    if ((doseUnit.isBlank() || doseUnit == "片") && d.optString("spec").isNotEmpty()) {
+                                        val u = OcrHelper.unitFromSpec(d.optString("spec"))
+                                        if (u.isNotEmpty()) { doseUnit = u; filled.add("剂量单位") }
+                                    }
                                     barcodeHint = if (filled.isNotEmpty()) "本地药品库匹配：${filled.joinToString("、")}（请核对，未识别的字段可拍照识别补充）"
                                                   else "本地药品库返回：${d.optString("raw_title")}（请核对）"
                                 }
@@ -617,6 +622,11 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
                             if (spec.isBlank() && p.spec.isNotEmpty()) { spec = p.spec; filled.add("规格") }
                             if (expiry.isBlank() && p.expiry.isNotEmpty()) { expiry = p.expiry; filled.add("有效期") }
                             if (approvalNo.isBlank() && p.approval.isNotEmpty()) { approvalNo = p.approval; filled.add("批准文号") }
+                            // 根据识别的规格自动推断日用量单位（如 胶囊→粒、颗粒→袋、口服液→支）
+                            if ((doseUnit.isBlank() || doseUnit == "片") && p.spec.isNotEmpty()) {
+                                val u = OcrHelper.unitFromSpec(p.spec)
+                                if (u.isNotEmpty()) { doseUnit = u; filled.add("剂量单位") }
+                            }
                             ocrHint = if (filled.isNotEmpty())
                                 "已识别（$source）：${filled.joinToString("、")}（请核对）"
                             else
@@ -653,6 +663,14 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
                 OutlinedTextField(spec, { spec = it }, label = { Text("规格（如 0.25g×24片）") },
                     modifier = Modifier.fillMaxWidth(), singleLine = true)
                 Spacer(Modifier.height(6.dp))
+                Row(Modifier.fillMaxWidth()) {
+                    OutlinedTextField(stock, { stock = it }, label = { Text("库存数量") },
+                        modifier = Modifier.weight(1f), singleLine = true)
+                    Spacer(Modifier.width(8.dp))
+                    OutlinedTextField(unit, { unit = it }, label = { Text("单位") },
+                        modifier = Modifier.weight(1f), singleLine = true)
+                }
+                Spacer(Modifier.height(6.dp))
                 OutlinedTextField(manufacturer, { manufacturer = it }, label = { Text("生产厂家（选填）") },
                     modifier = Modifier.fillMaxWidth(), singleLine = true)
                 Spacer(Modifier.height(6.dp))
@@ -661,14 +679,6 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
                 Spacer(Modifier.height(6.dp))
                 OutlinedTextField(expiry, { expiry = it }, label = { Text("有效期至（2026-12-31）") },
                     modifier = Modifier.fillMaxWidth(), singleLine = true)
-                Spacer(Modifier.height(6.dp))
-                Row(Modifier.fillMaxWidth()) {
-                    OutlinedTextField(stock, { stock = it }, label = { Text("库存数量") },
-                        modifier = Modifier.weight(1f), singleLine = true)
-                    Spacer(Modifier.width(8.dp))
-                    OutlinedTextField(unit, { unit = it }, label = { Text("单位") },
-                        modifier = Modifier.weight(1f), singleLine = true)
-                }
                 Spacer(Modifier.height(8.dp))
                 Text("日用量（用于推算何时该开药）", fontSize = 13.sp, color = Gray)
                 Spacer(Modifier.height(2.dp))

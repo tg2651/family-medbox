@@ -123,6 +123,29 @@ object OcrHelper {
         return r.copy(name = name, spec = spec, expiry = expiry, approval = apn)
     }
 
+    /** 根据规格文本推断剂量单位：0.25g×24片→片、2.5g×20袋→袋、10ml×6支→支 */
+    fun unitFromSpec(spec: String): String {
+        val s = spec.replace(" ", "")
+        return when {
+            s.contains("胶囊") -> "粒"
+            s.contains("颗粒") -> "袋"
+            s.contains("口服液") || s.contains("糖浆") || s.contains("合剂") -> "支"
+            s.contains("注射液") || s.contains("注射用") || s.contains("冻干") -> "支"
+            s.contains("滴眼液") || s.contains("滴鼻液") || s.contains("滴耳液") -> "支"
+            s.contains("丸") -> "丸"
+            s.contains("栓") -> "枚"
+            s.contains("贴") -> "贴"
+            s.contains("乳膏") || s.contains("软膏") || s.contains("凝胶") -> "支"
+            s.contains("气雾剂") || s.contains("喷雾剂") -> "瓶"
+            s.contains("袋") -> "袋"
+            s.contains("支") -> "支"
+            s.contains("瓶") -> "瓶"
+            s.contains("粒") -> "粒"
+            s.contains("片") -> "片"
+            else -> ""
+        }
+    }
+
     /** 解析处方文字，提取药名与用法用量 */
     fun parsePrescription(text: String): RxOcrResult {
         val lines = text.lines().map { it.trim() }.filter { it.isNotEmpty() }
