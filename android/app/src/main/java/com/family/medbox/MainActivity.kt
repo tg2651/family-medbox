@@ -111,11 +111,12 @@ fun RemoteImage(url: String, modifier: Modifier = Modifier, contentScale: Conten
 
 /** 药品拍照录入按钮：拍照→上传→返回图片 url */
 @Composable
-private fun MedPhotoPicker(imageUrl: String?, onPicked: (String) -> Unit, onClear: () -> Unit) {
+private fun MedPhotoPicker(imageUrl: String?, onPicked: (String) -> Unit, onClear: () -> Unit, onOcr: ((String) -> Unit)? = null) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     var photoUri by remember { mutableStateOf<Uri?>(null) }
     var busy by remember { mutableStateOf(false) }
+    var busyText by remember { mutableStateOf("处理中…") }
     var err by remember { mutableStateOf("") }
 
     val camLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
@@ -123,6 +124,16 @@ private fun MedPhotoPicker(imageUrl: String?, onPicked: (String) -> Unit, onClea
             scope.launch {
                 busy = true; err = ""
                 try {
+                    // 先 OCR 识别
+                    if (onOcr != null) {
+                        busyText = "识别中…"
+                        try {
+                            val text = OcrHelper.recognize(ctx, photoUri!!)
+                            if (text.isNotBlank()) onOcr(text)
+                        } catch (_: Exception) { /* 识别失败不阻塞 */ }
+                    }
+                    // 再上传图片
+                    busyText = "上传中…"
                     val b64 = imageToBase64(ctx, photoUri!!)
                     val r = ApiClient.post("/api/upload", JSONObject().put("image", b64)) as JSONObject
                     onPicked(r.getString("url"))
@@ -144,7 +155,7 @@ private fun MedPhotoPicker(imageUrl: String?, onPicked: (String) -> Unit, onClea
         }) {
             Icon(Icons.Filled.CameraAlt, null, Modifier.size(18.dp))
             Spacer(Modifier.width(6.dp))
-            Text(if (busy) "上传中…" else "拍照录入")
+            Text(if (busy) busyText else "拍照录入")
         }
         if (!imageUrl.isNullOrEmpty()) {
             Spacer(Modifier.width(8.dp))
@@ -505,6 +516,7 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
     var location by remember { mutableStateOf("") }
     var notes by remember { mutableStateOf("") }
     var imageUrl by remember { mutableStateOf("") }
+    var ocrHint by remember { mutableStateOf("") }
     var err by remember { mutableStateOf("") }
     val scope = rememberCoroutineScope()
 
@@ -513,8 +525,21 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
         title = { Text("添加药品") },
         text = {
             Column(Modifier.verticalScroll(rememberScrollState())) {
-                // 拍照录入
-                MedPhotoPicker(imageUrl.ifEmpty { null }, onPicked = { imageUrl = it }, onClear = { imageUrl = "" })
+                // 拍照录入（自动识别药品信息）
+                MedPhotoPicker(
+                    imageUrl.ifEmpty { null },
+                    onPicked = { imageUrl = it },
+                    onClear = { imageUrl = "" },
+                    onOcr = { text ->
+                        val p = OcrHelper.parseMedLabel(text)
+                        val filled = mutableListOf<String>()
+                        if (name.isBlank() && p.name.isNotEmpty()) { name = p.name; filled.add("名称") }
+                        if (spec.isBlank() && p.spec.isNotEmpty()) { spec = p.spec; filled.add("规格") }
+                        if (expiry.isBlank() && p.expiry.isNotEmpty()) { expiry = p.expiry; filled.add("有效期") }
+                        ocrHint = if (filled.isNotEmpty()) "已识别：${filled.joinToString("、")}（请核对）" else "未识别到药品信息，请手动填写"
+                    }
+                )
+                if (ocrHint.isNotEmpty()) Text(ocrHint, fontSize = 12.sp, color = Gray, modifier = Modifier.padding(top = 4.dp))
                 Spacer(Modifier.height(10.dp))
                 OutlinedTextField(name, { name = it }, label = { Text("药品名称 *") },
                     modifier = Modifier.fillMaxWidth(), singleLine = true)
@@ -702,11 +727,46 @@ private fun AddPlanDialog(userId: Int, onClose: () -> Unit) {
     var end by remember { mutableStateOf("") }
     var err by remember { mutableStateOf("") }
     var expanded by remember { mutableStateOf(false) }
+    var rxBusy by remember { mutableStateOf(false) }
+    var rxHint by remember { mutableStateOf("") }
+    var rxPhotoUri by remember { mutableStateOf<Uri?>(null) }
     val scope = rememberCoroutineScope()
+    val ctx = LocalContext.current
 
     LaunchedEffect(Unit) {
         try { meds = (ApiClient.get("/api/medicines") as? JSONArray)?.objs() ?: emptyList() }
         catch (e: Exception) { err = e.message ?: "" }
+    }
+
+    // 处方拍照识别
+    val rxCamLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
+        if (ok && rxPhotoUri != null) {
+            scope.launch {
+                rxBusy = true; rxHint = ""
+                try {
+                    val text = OcrHelper.recognize(ctx, rxPhotoUri!!)
+                    val p = OcrHelper.parsePrescription(text)
+                    val filled = mutableListOf<String>()
+                    // 匹配药品
+                    if (p.medName.isNotEmpty()) {
+                        val idx = meds.indexOfFirst {
+                            val n = it.optString("name")
+                            n.contains(p.medName) || p.medName.contains(n)
+                        }
+                        if (idx >= 0) { medIdx = idx; filled.add("药品：${meds[idx].optString("name")}") }
+                        else rxHint = "识别到「${p.medName}」但未在药品库中匹配，请先添加该药品"
+                    }
+                    if (p.timesPerDay > 0) { timesText = OcrHelper.defaultTimes(p.timesPerDay); filled.add("每日${p.timesPerDay}次") }
+                    if (p.dosePerTime.isNotEmpty()) { dose = p.dosePerTime; filled.add("每次${p.dosePerTime}${p.doseUnit}") }
+                    if (p.doseUnit.isNotEmpty()) doseUnit = p.doseUnit
+                    if (rxHint.isEmpty()) rxHint = if (filled.isNotEmpty()) "已识别：${filled.joinToString("，")}（请核对）" else "未识别到处方信息，请手动填写"
+                } catch (e: Exception) { rxHint = "识别失败：${e.message}" }
+                rxBusy = false
+            }
+        }
+    }
+    val rxPermLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
+        if (it) { val u = newPhotoUri(ctx); rxPhotoUri = u; rxCamLauncher.launch(u) }
     }
 
     AlertDialog(
@@ -714,6 +774,19 @@ private fun AddPlanDialog(userId: Int, onClose: () -> Unit) {
         title = { Text("新建用药计划") },
         text = {
             Column(Modifier.verticalScroll(rememberScrollState())) {
+                // 扫描处方自动识别
+                OutlinedButton(onClick = {
+                    if (rxBusy) return@OutlinedButton
+                    if (ContextCompat.checkSelfPermission(ctx, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+                        val u = newPhotoUri(ctx); rxPhotoUri = u; rxCamLauncher.launch(u)
+                    } else rxPermLauncher.launch(Manifest.permission.CAMERA)
+                }) {
+                    Icon(Icons.Filled.CameraAlt, null, Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(if (rxBusy) "识别中…" else "扫描处方自动识别")
+                }
+                if (rxHint.isNotEmpty()) Text(rxHint, fontSize = 12.sp, color = Gray, modifier = Modifier.padding(top = 4.dp))
+                Spacer(Modifier.height(10.dp))
                 // 药品下拉选择
                 ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = it }) {
                     OutlinedTextField(
