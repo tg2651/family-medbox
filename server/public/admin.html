@@ -62,11 +62,13 @@ button.mini{width:auto;padding:5px 12px;font-size:13px;margin:0}
       <button onclick="tab(1,this)">预警中心</button>
       <button onclick="tab(2,this)">邀请成员</button>
       <button onclick="tab(3,this)">AI配置</button>
+      <button onclick="tab(4,this)">药品库</button>
     </div>
     <div id="tab0"></div>
     <div id="tab1" style="display:none"></div>
     <div id="tab2" style="display:none"></div>
     <div id="tab3" style="display:none"></div>
+    <div id="tab4" style="display:none"></div>
   </main>
 </div>
 <script>
@@ -134,10 +136,48 @@ async function renewCode(){
 function tab(i,btn){
   document.querySelectorAll('.tabs button').forEach(b=>b.classList.remove('act'));
   btn.classList.add('act');
-  [0,1,2,3].forEach(k=>$('tab'+k).style.display=k===i?'':'none');
+  [0,1,2,3,4].forEach(k=>$('tab'+k).style.display=k===i?'':'none');
   if(i===0)init();
+  if(i===4)renderDrugCatalog();
 }
 function logout(){T='';localStorage.removeItem('admin_token');location.href='/admin.html';}
+async function renderDrugCatalog(){
+  let s={total:0,withBarcode:0};
+  try{s=await api('/admin/drug-catalog/stats');}catch(e){}
+  $('tab4').innerHTML=`
+  <div class="card"><h3>本地药品基础库（药监局数据集）</h3>
+    <div class="sub" style="margin-bottom:12px">将药监局公开的药品数据集导入为本地查询库，扫码时优先从这里查，无需调用任何外部接口。</div>
+    <div class="row" style="margin-bottom:12px">
+      <div>已收录：<b>${s.total}</b> 条（含条码 ${s.withBarcode} 条）</div>
+      <button class="mini" style="background:#dc2626" onclick="clearCatalog()">清空</button>
+    </div>
+    <label style="font-size:13px">导入数据（支持 CSV 或 JSON 数组）</label>
+    <div class="sub" style="margin:4px 0">CSV 每行：条码,批准文号,商品名,通用名,规格,生产企业,剂型,分类（至少前3列）。JSON 数组字段支持 barcode/approval_no/name/common_name/spec/manufacturer 及中文键名。</div>
+    <textarea id="cat_data" rows="6" style="width:100%;font-size:12px;font-family:monospace" placeholder="6920202883083,国药准字H53021979,感康,复方氨酚烷胺片,复方,吉林省吴太感康药业有限公司,片剂,感冒药"></textarea>
+    <div class="row" style="margin-top:8px">
+      <button class="mini" onclick="importCatalog('csv')">导入 CSV</button>
+      <button class="mini" onclick="importCatalog('json')">导入 JSON</button>
+      <span id="cat_msg" class="sub"></span>
+    </div>
+    <div class="sub" style="margin-top:12px;font-size:12px">
+      数据来源：国家药监局官网 → 药品 → 药品查询 → 数据下载（Excel/CSV 整理后粘贴到上方文本框）。条码列填药品外包装 EAN-13 码，批准文号格式如"国药准字H53021979"。
+    </div>
+  </div>`;
+}
+async function importCatalog(fmt){
+  const el=$('cat_msg');
+  el.style.color='';el.textContent='导入中…';
+  try{
+    const r=await api('/admin/drug-catalog/import',{method:'POST',body:JSON.stringify({format:fmt,data:$('cat_data').value})});
+    el.textContent='✓ 已导入 '+r.imported+' 条，库中共 '+r.total+' 条';
+    el.style.color='var(--ok)';
+    $('cat_data').value='';
+  }catch(e){el.textContent='✗ '+e.message;el.style.color='var(--bad)';}
+}
+async function clearCatalog(){
+  if(!confirm('确定清空本地药品库全部数据？'))return;
+  try{await api('/admin/drug-catalog/clear',{method:'POST',body:'{}'});renderDrugCatalog();}catch(e){alert(e.message);}
+}
 async function renderAiConfig(){
   let cfg={provider:'',model:'',baseUrl:'',apiKey:'',baiduAk:'',baiduSk:''};
   try{cfg=await api('/admin/ai-config');}catch(e){}

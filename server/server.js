@@ -81,7 +81,22 @@ CREATE TABLE IF NOT EXISTS users(
   age INTEGER, notes TEXT,
   created_at TEXT DEFAULT (datetime('now','localtime'))
 );
-CREATE TABLE IF NOT EXISTS medicines(
+CREATE TABLE IF NOT EXISTS drug_catalog (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  barcode TEXT DEFAULT '',
+  approval_no TEXT DEFAULT '',
+  name TEXT NOT NULL,
+  common_name TEXT DEFAULT '',
+  spec TEXT DEFAULT '',
+  manufacturer TEXT DEFAULT '',
+  dosage_form TEXT DEFAULT '',
+  category TEXT DEFAULT '',
+  created_at TEXT DEFAULT (datetime('now','localtime'))
+);
+CREATE INDEX IF NOT EXISTS idx_drug_barcode ON drug_catalog(barcode);
+CREATE INDEX IF NOT EXISTS idx_drug_approval ON drug_catalog(approval_no);
+CREATE INDEX IF NOT EXISTS idx_drug_name ON drug_catalog(name);
+CREATE TABLE IF NOT EXISTS medicines (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   family_id INTEGER NOT NULL,
   user_id INTEGER NOT NULL REFERENCES users(id),
@@ -164,7 +179,7 @@ function getSchedules(userId) {
 
 // ---------- API ----------
 const app = express();
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ extended: true }));
 // 兼容部分 HTTP 客户端（如安卓 HttpURLConnection）无法直接发送 PATCH：POST + X-HTTP-Method-Override 头转换
 app.use((req, res, next) => {
@@ -327,6 +342,12 @@ app.get('/api/medicine/barcode/:code', requireAuth, async (req, res) => {
   const local = db.prepare('SELECT * FROM medicines WHERE family_id=? AND barcode=? ORDER BY id DESC LIMIT 1')
     .get(req.user.family_id, code);
   if (local) return res.json({ found: 'local', code, medicine: local });
+  // 1.5) 本地药品基础库（药监局数据集导入）：条码→药品基础信息
+  const catalog = db.prepare('SELECT * FROM drug_catalog WHERE barcode=? LIMIT 1').get(code);
+  if (catalog) return res.json({ found: 'online', code, data: {
+    name: catalog.name, spec: catalog.spec, manufacturer: catalog.manufacturer,
+    approval_no: catalog.approval_no, raw_title: catalog.name, source: '本地药品库'
+  }});
   // 2) 后台自定义查询接口（可选，模板 {code} 占位）
   let customUrl = '';
   try { const r = db.prepare('SELECT value FROM settings WHERE key=?').get('barcode_lookup_url'); if (r) customUrl = JSON.parse(r.value).url || ''; } catch (e) {}
@@ -533,6 +554,58 @@ app.get('/api/admin/overview', requireAuth, requireAdmin, (req, res) => {
   alerts.refill.sort((a, b) => a.days_left - b.days_left);
   alerts.expiry.sort((a, b) => a.days_left - b.days_left);
   res.json({ members: result, alerts });
+});
+
+// --- 本地药品基础库（药监局数据集） ---
+// 导入：CSV（每行一条，列：条码,批准文号,商品名,通用名,规格,生产企业,剂型,分类）或 JSON 数组
+app.post('/api/admin/drug-catalog/import', requireAuth, requireAdmin, (req, res) => {
+  const { format, data } = req.body || {};
+  if (!data) return bad(res, '无数据');
+  let rows = [];
+  try {
+    if (format === 'csv') {
+      const lines = String(data).split(/\r?\n/).map(l => l.trim()).filter(l => l && !l.startsWith('#'));
+      for (const line of lines) {
+        const c = line.split(/,|\t/).map(s => s.trim().replace(/^"|"$/g, ''));
+        if (c.length >= 3) rows.push({ barcode: c[0] || '', approval_no: c[1] || '', name: c[2] || '', common_name: c[3] || '', spec: c[4] || '', manufacturer: c[5] || '', dosage_form: c[6] || '', category: c[7] || '' });
+      }
+    } else if (format === 'json') {
+      const arr = typeof data === 'string' ? JSON.parse(data) : data;
+      rows = (Array.isArray(arr) ? arr : []).map(o => ({
+        barcode: String(o.barcode || o.code || '').trim(),
+        approval_no: String(o.approval_no || o.approvalNo || o.批准文号 || '').trim(),
+        name: String(o.name || o.商品名 || o.name_zh || '').trim(),
+        common_name: String(o.common_name || o.commonName || o.通用名 || '').trim(),
+        spec: String(o.spec || o.specification || o.规格 || '').trim(),
+        manufacturer: String(o.manufacturer || o.producer || o.生产企业 || '').trim(),
+        dosage_form: String(o.dosage_form || o.dosageForm || o.剂型 || '').trim(),
+        category: String(o.category || o.分类 || '').trim()
+      })).filter(r => r.name);
+    }
+  } catch (e) { return bad(res, '数据解析失败：' + e.message); }
+  if (!rows.length) return bad(res, '未解析到有效数据（CSV需至少3列：条码,批准文号,商品名）');
+  const stmt = db.prepare('INSERT INTO drug_catalog(barcode,approval_no,name,common_name,spec,manufacturer,dosage_form,category) VALUES(?,?,?,?,?,?,?,?)');
+  let n = 0;
+  db.exec('BEGIN');
+  try {
+    for (const r of rows) { stmt.run(r.barcode, r.approval_no, r.name, r.common_name, r.spec, r.manufacturer, r.dosage_form, r.category); n++; }
+    db.exec('COMMIT');
+  } catch (e) { db.exec('ROLLBACK'); return bad(res, '导入失败：' + e.message); }
+  const total = db.prepare('SELECT COUNT(*) c FROM drug_catalog').get().c;
+  res.json({ imported: n, total });
+});
+
+// 清空本地药品库
+app.post('/api/admin/drug-catalog/clear', requireAuth, requireAdmin, (req, res) => {
+  db.exec('DELETE FROM drug_catalog');
+  res.json({ ok: true });
+});
+
+// 本地药品库统计
+app.get('/api/admin/drug-catalog/stats', requireAuth, requireAdmin, (req, res) => {
+  const total = db.prepare('SELECT COUNT(*) c FROM drug_catalog').get().c;
+  const withBarcode = db.prepare("SELECT COUNT(*) c FROM drug_catalog WHERE barcode != ''").get().c;
+  res.json({ total, withBarcode });
 });
 
 // --- AI 模型配置（管理员） ---
