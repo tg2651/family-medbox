@@ -403,7 +403,10 @@ app.get('/api/medicine/barcode/:code', requireAuth, async (req, res) => {
     if (parsed && parsed.name) return res.json({ found: 'online', code, data: parsed });
     tried.push('OpenProductsFacts无数据');
   } catch (e) { tried.push('OpenProductsFacts不可达'); }
-  res.json({ found: false, code, message: '各公开条码库均未收录（' + tried.join('，') + '）' });
+  let msg = '各公开条码库均未收录（' + tried.join('，') + '）';
+  if (code.length === 13 && code.startsWith('69')) msg += '。69开头的商品条码在国内没有免费公开查询库（GS1中国需授权），建议用「拍照录入」AI识别药盒名称，保存后全家扫这个码即可秒出全部信息';
+  else if (code.length === 14 && code.startsWith('86')) msg += '。该本位码未收录，可核对包装上的条码数字后在添加页手动输入查询';
+  res.json({ found: false, code, message: msg });
 });
 
 app.post('/api/medicines', requireAuth, (req, res) => {
