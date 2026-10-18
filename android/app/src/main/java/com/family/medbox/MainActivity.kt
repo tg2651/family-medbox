@@ -111,7 +111,7 @@ fun RemoteImage(url: String, modifier: Modifier = Modifier, contentScale: Conten
 
 /** 药品拍照录入按钮：拍照→上传→返回图片 url */
 @Composable
-private fun MedPhotoPicker(imageUrl: String?, onPicked: (String) -> Unit, onClear: () -> Unit, onOcr: ((String) -> Unit)? = null) {
+private fun MedPhotoPicker(imageUrl: String?, onResult: (imageUrl: String, ocr: MedOcrResult?) -> Unit, onClear: () -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     var photoUri by remember { mutableStateOf<Uri?>(null) }
@@ -124,19 +124,32 @@ private fun MedPhotoPicker(imageUrl: String?, onPicked: (String) -> Unit, onClea
             scope.launch {
                 busy = true; err = ""
                 try {
-                    // 先 OCR 识别
-                    if (onOcr != null) {
-                        busyText = "识别中…"
+                    val b64 = imageToBase64(ctx, photoUri!!)
+                    // 优先服务端 AI 识别
+                    busyText = "AI识别中…"
+                    var ocr: MedOcrResult? = null
+                    try {
+                        val r = ApiClient.post("/api/ai/recognize",
+                            JSONObject().put("image", b64).put("type", "medicine")) as JSONObject
+                        if (r.optString("name").isNotEmpty() || r.optString("spec").isNotEmpty()) {
+                            ocr = MedOcrResult(
+                                name = r.optString("name"),
+                                spec = r.optString("spec"),
+                                expiry = r.optString("expiry_date"),
+                                rawText = r.optString("raw")
+                            )
+                        }
+                    } catch (_: Exception) {
+                        // AI 不可用 → 降级本地 OCR
                         try {
                             val text = OcrHelper.recognize(ctx, photoUri!!)
-                            if (text.isNotBlank()) onOcr(text)
-                        } catch (_: Exception) { /* 识别失败不阻塞 */ }
+                            if (text.isNotBlank()) ocr = OcrHelper.parseMedLabel(text)
+                        } catch (_: Exception) { }
                     }
-                    // 再上传图片
+                    // 上传图片
                     busyText = "上传中…"
-                    val b64 = imageToBase64(ctx, photoUri!!)
-                    val r = ApiClient.post("/api/upload", JSONObject().put("image", b64)) as JSONObject
-                    onPicked(r.getString("url"))
+                    val up = ApiClient.post("/api/upload", JSONObject().put("image", b64)) as JSONObject
+                    onResult(up.getString("url"), ocr)
                 } catch (e: Exception) { err = e.message ?: "上传失败" }
                 busy = false
             }
@@ -528,16 +541,18 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
                 // 拍照录入（自动识别药品信息）
                 MedPhotoPicker(
                     imageUrl.ifEmpty { null },
-                    onPicked = { imageUrl = it },
-                    onClear = { imageUrl = "" },
-                    onOcr = { text ->
-                        val p = OcrHelper.parseMedLabel(text)
-                        val filled = mutableListOf<String>()
-                        if (name.isBlank() && p.name.isNotEmpty()) { name = p.name; filled.add("名称") }
-                        if (spec.isBlank() && p.spec.isNotEmpty()) { spec = p.spec; filled.add("规格") }
-                        if (expiry.isBlank() && p.expiry.isNotEmpty()) { expiry = p.expiry; filled.add("有效期") }
-                        ocrHint = if (filled.isNotEmpty()) "已识别：${filled.joinToString("、")}（请核对）" else "未识别到药品信息，请手动填写"
-                    }
+                    onResult = { url, ocr ->
+                        imageUrl = url
+                        val p = ocr
+                        if (p != null) {
+                            val filled = mutableListOf<String>()
+                            if (name.isBlank() && p.name.isNotEmpty()) { name = p.name; filled.add("名称") }
+                            if (spec.isBlank() && p.spec.isNotEmpty()) { spec = p.spec; filled.add("规格") }
+                            if (expiry.isBlank() && p.expiry.isNotEmpty()) { expiry = p.expiry; filled.add("有效期") }
+                            ocrHint = if (filled.isNotEmpty()) "已识别：${filled.joinToString("、")}（请核对）" else "未识别到药品信息，请手动填写"
+                        }
+                    },
+                    onClear = { imageUrl = "" }
                 )
                 if (ocrHint.isNotEmpty()) Text(ocrHint, fontSize = 12.sp, color = Gray, modifier = Modifier.padding(top = 4.dp))
                 Spacer(Modifier.height(10.dp))
@@ -744,22 +759,44 @@ private fun AddPlanDialog(userId: Int, onClose: () -> Unit) {
             scope.launch {
                 rxBusy = true; rxHint = ""
                 try {
-                    val text = OcrHelper.recognize(ctx, rxPhotoUri!!)
-                    val p = OcrHelper.parsePrescription(text)
+                    val b64 = imageToBase64(ctx, rxPhotoUri!!)
+                    // 优先服务端 AI 识别处方
+                    var medName = ""; var timesPerDay = 0; var dosePerTime = ""; var unit = ""
+                    var aiUsed = false
+                    try {
+                        val r = ApiClient.post("/api/ai/recognize",
+                            JSONObject().put("image", b64).put("type", "prescription")) as JSONObject
+                        val arr = r.optJSONArray("meds")
+                        if (arr != null && arr.length() > 0) {
+                            val m = arr.getJSONObject(0)
+                            medName = m.optString("name")
+                            timesPerDay = m.optInt("times_per_day")
+                            dosePerTime = m.optString("dose_per_time")
+                            unit = m.optString("dose_unit", "片")
+                            aiUsed = true
+                        }
+                    } catch (_: Exception) {
+                        // 降级本地 OCR
+                        try {
+                            val text = OcrHelper.recognize(ctx, rxPhotoUri!!)
+                            val p = OcrHelper.parsePrescription(text)
+                            medName = p.medName; timesPerDay = p.timesPerDay
+                            dosePerTime = p.dosePerTime; unit = p.doseUnit
+                        } catch (_: Exception) { }
+                    }
                     val filled = mutableListOf<String>()
-                    // 匹配药品
-                    if (p.medName.isNotEmpty()) {
+                    if (medName.isNotEmpty()) {
                         val idx = meds.indexOfFirst {
                             val n = it.optString("name")
-                            n.contains(p.medName) || p.medName.contains(n)
+                            n.contains(medName) || medName.contains(n)
                         }
                         if (idx >= 0) { medIdx = idx; filled.add("药品：${meds[idx].optString("name")}") }
-                        else rxHint = "识别到「${p.medName}」但未在药品库中匹配，请先添加该药品"
+                        else rxHint = "识别到「$medName」但未在药品库中匹配，请先添加该药品"
                     }
-                    if (p.timesPerDay > 0) { timesText = OcrHelper.defaultTimes(p.timesPerDay); filled.add("每日${p.timesPerDay}次") }
-                    if (p.dosePerTime.isNotEmpty()) { dose = p.dosePerTime; filled.add("每次${p.dosePerTime}${p.doseUnit}") }
-                    if (p.doseUnit.isNotEmpty()) doseUnit = p.doseUnit
-                    if (rxHint.isEmpty()) rxHint = if (filled.isNotEmpty()) "已识别：${filled.joinToString("，")}（请核对）" else "未识别到处方信息，请手动填写"
+                    if (timesPerDay > 0) { timesText = OcrHelper.defaultTimes(timesPerDay); filled.add("每日${timesPerDay}次") }
+                    if (dosePerTime.isNotEmpty()) { dose = dosePerTime; filled.add("每次$dosePerTime$unit") }
+                    if (unit.isNotEmpty()) doseUnit = unit
+                    if (rxHint.isEmpty()) rxHint = if (filled.isNotEmpty()) "已识别${if (aiUsed) "(AI)" else ""}：${filled.joinToString("，")}（请核对）" else "未识别到处方信息，请手动填写"
                 } catch (e: Exception) { rxHint = "识别失败：${e.message}" }
                 rxBusy = false
             }

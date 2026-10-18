@@ -4,6 +4,7 @@ const { DatabaseSync } = require('node:sqlite');
 const crypto = require('crypto');
 const path = require('path');
 const fs = require('fs');
+const ai = require('./aiRecognize');
 
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -241,6 +242,19 @@ app.post('/api/upload', requireAuth, (req, res) => {
   const name = `med_${Date.now()}_${Math.random().toString(36).slice(2, 8)}.jpg`;
   fs.writeFileSync(path.join(DATA_DIR, 'uploads', name), buf);
   res.json({ url: `/uploads/${name}` });
+});
+
+// --- AI 识别（药品包装 / 处方） ---
+app.post('/api/ai/recognize', requireAuth, async (req, res) => {
+  try {
+    const data = (req.body.image || '').replace(/^data:image\/\w+;base64,/, '');
+    if (!data) return bad(res, '图片数据为空');
+    const type = req.body.type === 'prescription' ? 'prescription' : 'medicine';
+    const buf = Buffer.from(data, 'base64');
+    if (buf.length > 8 * 1024 * 1024) return bad(res, '图片过大（限 8MB）');
+    const r = type === 'prescription' ? await ai.recognizePrescription(data) : await ai.recognizeMedicine(data);
+    res.json(r);
+  } catch (e) { bad(res, e.message || 'AI识别失败'); }
 });
 
 app.post('/api/medicines', requireAuth, (req, res) => {
