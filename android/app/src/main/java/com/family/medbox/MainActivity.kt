@@ -31,7 +31,6 @@ import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Medication
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.Schedule
-import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.Today
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -128,11 +127,11 @@ private fun MedPhotoPicker(imageUrl: String?, onResult: (imageUrl: String, ocr: 
                     val b64 = imageToBase64(ctx, photoUri!!)
                     var ocr: MedOcrResult? = null
                     var source = ""
-                    // 优先服务端 AI 识别
+                    // 优先服务端 AI 识别（本地大模型较慢，用 120 秒超时）
                     busyText = "AI识别中…"
                     try {
                         val r = ApiClient.post("/api/ai/recognize",
-                            JSONObject().put("image", b64).put("type", "medicine")) as JSONObject
+                            JSONObject().put("image", b64).put("type", "medicine"), 120000) as JSONObject
                         val aiName = r.optString("name")
                         val aiSpec = r.optString("spec")
                         val aiExpiry = r.optString("expiry_date")
@@ -535,54 +534,10 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
     var location by remember { mutableStateOf("") }
     var notes by remember { mutableStateOf("") }
     var imageUrl by remember { mutableStateOf("") }
-    var traceCode by remember { mutableStateOf("") }
-    var traceHint by remember { mutableStateOf("") }
     var ocrHint by remember { mutableStateOf("") }
     var err by remember { mutableStateOf("") }
     val scope = rememberCoroutineScope()
     val ctx = LocalContext.current
-    var tracePhotoUri by remember { mutableStateOf<Uri?>(null) }
-    var traceBusy by remember { mutableStateOf(false) }
-    val traceCamLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
-        if (ok && tracePhotoUri != null) {
-            scope.launch {
-                traceBusy = true; traceHint = ""
-                try {
-                    val code = OcrHelper.scanBarcode(ctx, tracePhotoUri!!)
-                    if (code.isNotBlank()) {
-                        traceCode = code
-                        traceHint = "已扫描追溯码：$code"
-                        // 调用服务端查询药品信息
-                        try {
-                            val r = ApiClient.post("/api/medicine/lookup", JSONObject().put("code", code)) as JSONObject
-                            if (r.optBoolean("looked_up")) {
-                                val data = r.optJSONObject("data")
-                                if (data != null) {
-                                    val filled = mutableListOf<String>()
-                                    val n = data.optString("name").ifEmpty { data.optString("药品名称") }
-                                    val s = data.optString("spec").ifEmpty { data.optString("规格") }
-                                    val e = data.optString("expiry_date").ifEmpty { data.optString("有效期") }
-                                    if (name.isBlank() && n.isNotEmpty()) { name = n; filled.add("名称") }
-                                    if (spec.isBlank() && s.isNotEmpty()) { spec = s; filled.add("规格") }
-                                    if (expiry.isBlank() && e.isNotEmpty()) { expiry = e; filled.add("有效期") }
-                                    if (filled.isNotEmpty()) traceHint += "，已填充：${filled.joinToString("、")}"
-                                    else traceHint += "（请核对信息）"
-                                }
-                            } else {
-                                traceHint += "（${r.optString("message")}）"
-                            }
-                        } catch (_: Exception) { traceHint += "（查询接口异常）" }
-                    } else {
-                        traceHint = "未识别到条码，请对准药品追溯码重新扫描"
-                    }
-                } catch (e: Exception) { traceHint = "扫描失败：${e.message}" }
-                traceBusy = false
-            }
-        }
-    }
-    val tracePermLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
-        if (it) { val u = newPhotoUri(ctx); tracePhotoUri = u; traceCamLauncher.launch(u) }
-    }
 
     AlertDialog(
         onDismissRequest = onClose,
@@ -611,24 +566,6 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
                     onClear = { imageUrl = "" }
                 )
                 if (ocrHint.isNotEmpty()) Text(ocrHint, fontSize = 12.sp, color = Gray, modifier = Modifier.padding(top = 4.dp))
-                Spacer(Modifier.height(8.dp))
-                // 扫描药品追溯码
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    OutlinedButton(onClick = {
-                        if (ContextCompat.checkSelfPermission(ctx, android.Manifest.permission.CAMERA) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
-                            val u = newPhotoUri(ctx); tracePhotoUri = u; traceCamLauncher.launch(u)
-                        } else tracePermLauncher.launch(android.Manifest.permission.CAMERA)
-                    }, enabled = !traceBusy) {
-                        Icon(Icons.Filled.Search, null, modifier = Modifier.size(18.dp))
-                        Spacer(Modifier.width(4.dp))
-                        Text(if (traceBusy) "扫描中…" else "扫描追溯码")
-                    }
-                    if (traceCode.isNotEmpty()) {
-                        Spacer(Modifier.width(8.dp))
-                        Text("追溯码: ${traceCode.take(12)}…", fontSize = 12.sp, color = Blue)
-                    }
-                }
-                if (traceHint.isNotEmpty()) Text(traceHint, fontSize = 12.sp, color = Gray, modifier = Modifier.padding(top = 4.dp))
                 Spacer(Modifier.height(10.dp))
                 OutlinedTextField(name, { name = it }, label = { Text("药品名称 *") },
                     modifier = Modifier.fillMaxWidth(), singleLine = true)
@@ -676,7 +613,7 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
                             .put("stock_qty", stock.toDoubleOrNull() ?: 0.0)
                             .put("unit", unit.trim()).put("daily_dose", dailyDose.toDoubleOrNull() ?: 0.0)
                             .put("dose_unit", doseUnit.trim()).put("location", location.trim())
-                            .put("notes", notes.trim()).put("image_url", imageUrl).put("trace_code", traceCode)
+                            .put("notes", notes.trim()).put("image_url", imageUrl)
                         if (userId >= 0) body.put("user_id", userId)
                         ApiClient.post("/api/medicines", body)
                         onClose()
@@ -839,7 +776,7 @@ private fun AddPlanDialog(userId: Int, onClose: () -> Unit) {
                     var aiUsed = false
                     try {
                         val r = ApiClient.post("/api/ai/recognize",
-                            JSONObject().put("image", b64).put("type", "prescription")) as JSONObject
+                            JSONObject().put("image", b64).put("type", "prescription"), 120000) as JSONObject
                         val arr = r.optJSONArray("meds")
                         if (arr != null && arr.length() > 0) {
                             val m = arr.getJSONObject(0)

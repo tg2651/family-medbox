@@ -18,7 +18,7 @@ object ApiClient {
 
     class ApiError(msg: String) : Exception(msg)
 
-    private fun request(method: String, path: String, body: JSONObject?): Any? {
+    private fun request(method: String, path: String, body: JSONObject?, readTimeoutMs: Int = 15000): Any? {
         val conn = URL(baseUrl + path).openConnection() as HttpURLConnection
         try {
             // HttpURLConnection 不支持 PATCH，用 POST + X-HTTP-Method-Override 头转换（服务端已支持）
@@ -26,7 +26,7 @@ object ApiClient {
             conn.requestMethod = realMethod
             if (method == "PATCH") conn.setRequestProperty("X-HTTP-Method-Override", "PATCH")
             conn.connectTimeout = 10000
-            conn.readTimeout = 15000
+            conn.readTimeout = readTimeoutMs
             conn.setRequestProperty("Content-Type", "application/json; charset=utf-8")
             if (token.isNotEmpty()) conn.setRequestProperty("Authorization", "Bearer $token")
             if (body != null) {
@@ -49,7 +49,8 @@ object ApiClient {
     }
 
     suspend fun get(path: String): Any? = withContext(Dispatchers.IO) { request("GET", path, null) }
-    suspend fun post(path: String, body: JSONObject): Any? = withContext(Dispatchers.IO) { request("POST", path, body) }
+    suspend fun post(path: String, body: JSONObject, timeoutMs: Int = 15000): Any? =
+        withContext(Dispatchers.IO) { request("POST", path, body, timeoutMs) }
     suspend fun patch(path: String, body: JSONObject): Any? = withContext(Dispatchers.IO) { request("PATCH", path, body) }
     suspend fun delete(path: String): Any? = withContext(Dispatchers.IO) { request("DELETE", path, null) }
 }

@@ -13,7 +13,6 @@ const db = new DatabaseSync(path.join(DATA_DIR, 'medbox.db'));
 db.exec('PRAGMA journal_mode = WAL');
 // 旧库兼容：补 image_url 列
 try { db.exec('ALTER TABLE medicines ADD COLUMN image_url TEXT DEFAULT \'\''); } catch (e) {}
-try { db.exec('ALTER TABLE medicines ADD COLUMN trace_code TEXT DEFAULT \'\''); } catch (e) {}
 
 // 设置表（键值对）
 db.exec(`CREATE TABLE IF NOT EXISTS settings (
@@ -272,39 +271,14 @@ app.post('/api/ai/recognize', requireAuth, async (req, res) => {
   } catch (e) { bad(res, e.message || 'AI识别失败'); }
 });
 
-// --- 药品追溯码查询 ---
-// 优先调用后台配置的外部药品查询API；未配置时返回追溯码本身，由客户端配合拍照AI识别填充
-app.post('/api/medicine/lookup', requireAuth, async (req, res) => {
-  const code = (req.body.code || '').trim();
-  if (!code) return bad(res, '追溯码不能为空');
-  // 读取配置的药品查询接口（可选）
-  let lookupUrl = '';
-  try { const r = db.prepare('SELECT value FROM settings WHERE key=?').get('drug_lookup_url'); if (r) lookupUrl = JSON.parse(r.value).url || ''; } catch (e) {}
-  if (!lookupUrl) return res.json({ code, looked_up: false, message: '未配置药品查询接口，已记录追溯码，请配合拍照识别药品信息' });
-  try {
-    const url = lookupUrl.replace('{code}', encodeURIComponent(code));
-    const data = await new Promise((resolve, reject) => {
-      const u = new URL(url);
-      const lib = u.protocol === 'http:' ? http : https;
-      const req2 = lib.request({ hostname: u.hostname, port: u.port, path: u.pathname + u.search, method: 'GET' }, (resp) => {
-        let body = ''; resp.on('data', d => body += d); resp.on('end', () => { try { resolve(JSON.parse(body)); } catch { resolve({ raw: body }); } });
-      });
-      req2.on('error', reject); req2.setTimeout(10000, () => req2.destroy(new Error('查询超时'))); req2.end();
-    });
-    res.json({ code, looked_up: true, data });
-  } catch (e) {
-    res.json({ code, looked_up: false, message: '查询失败：' + (e.message || e), error: true });
-  }
-});
-
 app.post('/api/medicines', requireAuth, (req, res) => {
-  const { name, spec, category, expiry_date, stock_qty, unit, daily_dose, dose_unit, location, notes, image_url, trace_code } = req.body;
+  const { name, spec, category, expiry_date, stock_qty, unit, daily_dose, dose_unit, location, notes, image_url } = req.body;
   if (!name) return bad(res, '药品名称必填');
   let uid = req.user.id;
   if (req.body.user_id && req.user.role === 'admin') uid = +req.body.user_id;
-  const info = db.prepare(`INSERT INTO medicines(family_id,user_id,name,spec,category,expiry_date,stock_qty,unit,daily_dose,dose_unit,location,notes,image_url,trace_code)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(req.user.family_id, uid, name, spec || '', category || '', expiry_date || '', +stock_qty || 0, unit || '盒', +daily_dose || 0, dose_unit || '片', location || '', notes || '', image_url || '', trace_code || '');
+  const info = db.prepare(`INSERT INTO medicines(family_id,user_id,name,spec,category,expiry_date,stock_qty,unit,daily_dose,dose_unit,location,notes,image_url)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(req.user.family_id, uid, name, spec || '', category || '', expiry_date || '', +stock_qty || 0, unit || '盒', +daily_dose || 0, dose_unit || '片', location || '', notes || '', image_url || '');
   res.json({ id: Number(info.lastInsertRowid) });
 });
 
@@ -312,7 +286,7 @@ app.patch('/api/medicines/:id', requireAuth, (req, res) => {
   const m = db.prepare('SELECT * FROM medicines WHERE id=?').get(req.params.id);
   if (!m || m.family_id !== req.user.family_id) return bad(res, '药品不存在');
   if (m.user_id !== req.user.id && req.user.role !== 'admin') return bad(res, '无权限');
-  const f = ['name', 'spec', 'category', 'expiry_date', 'stock_qty', 'unit', 'daily_dose', 'dose_unit', 'location', 'notes', 'image_url', 'trace_code'];
+  const f = ['name', 'spec', 'category', 'expiry_date', 'stock_qty', 'unit', 'daily_dose', 'dose_unit', 'location', 'notes', 'image_url'];
   const sets = [], vals = [];
   for (const k of f) if (req.body[k] !== undefined) { sets.push(`${k}=?`); vals.push(req.body[k]); }
   if (sets.length) db.prepare(`UPDATE medicines SET ${sets.join(',')} WHERE id=?`).run(...vals, m.id);
@@ -473,8 +447,6 @@ app.get('/api/admin/overview', requireAuth, requireAdmin, (req, res) => {
 // --- AI 模型配置（管理员） ---
 app.get('/api/admin/ai-config', requireAuth, requireAdmin, (req, res) => {
   const cfg = ai.getCfg();
-  let drugLookupUrl = '';
-  try { const r = db.prepare('SELECT value FROM settings WHERE key=?').get('drug_lookup_url'); if (r) drugLookupUrl = JSON.parse(r.value).url || ''; } catch (e) {}
   const masked = {
     provider: cfg.provider || '',
     model: cfg.model || '',
@@ -482,14 +454,13 @@ app.get('/api/admin/ai-config', requireAuth, requireAdmin, (req, res) => {
     apiKey: cfg.apiKey ? '****' : '',
     baiduAk: cfg.baiduAk ? '****' : '',
     baiduSk: cfg.baiduSk ? '****' : '',
-    fromEnv: !ai.runtimeSet,
-    drugLookupUrl
+    fromEnv: !ai.runtimeSet
   };
   res.json(masked);
 });
 
 app.post('/api/admin/ai-config', requireAuth, requireAdmin, (req, res) => {
-  const { provider, apiKey, baseUrl, model, baiduAk, baiduSk, drugLookupUrl } = req.body || {};
+  const { provider, apiKey, baseUrl, model, baiduAk, baiduSk } = req.body || {};
   const cur = ai.getCfg();
   const cfg = {
     provider: (provider || '').toLowerCase(),
@@ -501,10 +472,6 @@ app.post('/api/admin/ai-config', requireAuth, requireAdmin, (req, res) => {
   };
   db.prepare('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value')
     .run('ai_config', JSON.stringify(cfg));
-  if (drugLookupUrl !== undefined) {
-    db.prepare('INSERT INTO settings(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value')
-      .run('drug_lookup_url', JSON.stringify({ url: drugLookupUrl || '' }));
-  }
   ai.setRuntimeConfig(cfg);
   res.json({ ok: true, provider: cfg.provider });
 });
