@@ -102,12 +102,117 @@ async function renderToday(){
 async function mark(sid,time,st){await api('/intake',{method:'POST',body:JSON.stringify({schedule_id:sid,plan_time:time,status:st})});renderToday();renderMeds();}
 async function renderMeds(){
   const meds=await api('/medicines');
-  $('tab1').innerHTML=`<div class="card"><h1 style="font-size:16px">我的药品（${meds.length}）</h1>`+
+  $('tab1').innerHTML=`<div class="card"><h1 style="font-size:16px">我的药品（${meds.length}）</h1>
+  <button onclick="toggleMedForm()">＋ 扫码添加药品</button>
+  <div id="medform" style="display:none;margin-top:6px">
+    <div class="row">
+      <input id="mf_code" inputmode="numeric" placeholder="条码/本位码（8-14位数字）">
+      <button style="flex:0 0 auto;width:auto" onclick="medScan()">📷 扫码</button>
+      <button style="flex:0 0 auto;width:auto" onclick="medLookup()">查询填充</button>
+    </div>
+    <div class="sub" id="mf_msg" style="margin:-4px 0 8px">支持药盒 EAN-13 商品条码与药监局本位码（86 开头 14 位）。无摄像头权限时可直接手动输入后点「查询填充」。</div>
+    <input id="mf_name" placeholder="药品名称 *">
+    <input id="mf_spec" placeholder="规格（如 0.25g×24片）">
+    <input id="mf_manu" placeholder="生产厂家（选填）">
+    <input id="mf_appr" placeholder="批准文号 / 本位码（选填）">
+    <input id="mf_exp" placeholder="有效期至（2026-12-31）">
+    <div class="row">
+      <input id="mf_stock" inputmode="decimal" placeholder="库存数量">
+      <input id="mf_unit" placeholder="单位（盒）">
+    </div>
+    <div class="row">
+      <input id="mf_dd" inputmode="decimal" placeholder="每日用量">
+      <input id="mf_du" placeholder="剂量单位（片）">
+    </div>
+    <input id="mf_loc" placeholder="存放位置（如 客厅药箱）">
+    <input id="mf_notes" placeholder="备注">
+    <button onclick="saveMed()">保存药品</button>
+  </div>`+
   (meds.length?meds.map(m=>`<div class="med"><div class="t">${h(m.name)} <span class="sub">${h(m.spec)} ${h(m.category)}</span></div>
   <div class="sub">余 ${h(m.stock_qty)} ${h(m.unit)} · 日用量 ${h(m.daily_dose)} ${h(m.dose_unit)} ${m.expiry_date?('· 有效期至 '+h(m.expiry_date)):''} ${m.location?('· 存放：'+h(m.location)):''}</div>
+  ${m.approval_no?`<div class="sub">批准文号：${h(m.approval_no)}${m.barcode?(' · 条码 '+h(m.barcode)):''}</div>`:''}
   ${m.refill&&m.refill.needRefill?`<div class="warn">库存仅够 ${m.refill.daysLeft} 天，该开药了</div>`:''}
   ${m.expiry&&m.expiry.expired?'<div class="bad">已过期，请勿服用</div>':(m.expiry&&m.expiry.nearExpiry?`<div class="warn">${m.expiry.daysLeft} 天后到期</div>`:'')}</div>`).join('')
-  :'<div class="sub">暂无药品，请先由管理员或 APP 添加</div>')+'</div>';
+  :'<div class="sub">暂无药品，点上方按钮扫码或手动添加</div>')+'</div>';
+}
+let medStream=null;
+function toggleMedForm(){const f=$('medform');f.style.display=f.style.display==='none'?'':'none';if(f.style.display==='none')stopScan();}
+function medMsg(s){const e=$('mf_msg');if(e){e.textContent=s;e.style.color='';}}
+function medErr(s){const e=$('mf_msg');if(e){e.textContent=s;e.style.color='var(--bad)';}}
+async function medScan(){
+  if(!('BarcodeDetector' in window)){medErr('当前浏览器不支持网页扫码（BarcodeDetector），请手动输入条码/本位码后点「查询填充」');return;}
+  try{
+    medStream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}});
+  }catch(e){medErr('无法打开摄像头：'+e.message+'（可手动输入条码）');return;}
+  const ov=$('scanov');ov.style.display='flex';
+  const v=$('scanvid');v.srcObject=medStream;try{await v.play();}catch(e){}
+  let det;
+  try{det=new BarcodeDetector({formats:['ean_13','ean_8','upc_a','upc_e','code_128','code_39','codabar','itf']});}
+  catch(e){det=new BarcodeDetector();}
+  const timer=setInterval(async()=>{
+    try{
+      const codes=await det.detect(v);
+      if(codes&&codes.length){
+        const raw=String(codes[0].rawValue||'').replace(/\D/g,'');
+        if(raw.length>=8&&raw.length<=14){stopScan();$('mf_code').value=raw;medLookup();}
+      }
+    }catch(e){}
+  },400);
+  ov.dataset.timer=timer;
+}
+function stopScan(){
+  const ov=$('scanov');
+  const t=+(ov&&ov.dataset.timer);if(t)clearInterval(t);if(ov)ov.dataset.timer='';
+  if(medStream){medStream.getTracks().forEach(x=>x.stop());medStream=null;}
+  if(ov)ov.style.display='none';
+}
+async function medLookup(){
+  const code=($('mf_code').value||'').trim();
+  if(!/^\d{8,14}$/.test(code)){medErr('请输入 8-14 位数字条码或本位码');return;}
+  medMsg('查询中…');
+  try{
+    const r=await api('/medicine/barcode/'+code);
+    const filled=[];
+    const set=(id,v,tag)=>{if(v!==''&&v!=null&&$(id).value===''){$(id).value=v;filled.push(tag);}};
+    if(r.found==='local'){
+      const m=r.medicine;
+      set('mf_name',m.name,'名称');set('mf_spec',m.spec,'规格');set('mf_exp',m.expiry_date,'有效期');
+      set('mf_manu',m.manufacturer,'厂家');set('mf_appr',m.approval_no,'批准文号');
+      set('mf_stock',m.stock_qty!=null?String(m.stock_qty):'','库存');set('mf_unit',m.unit,'单位');
+      set('mf_dd',m.daily_dose!=null?String(m.daily_dose):'','日用量');set('mf_du',m.dose_unit,'剂量单位');
+      set('mf_loc',m.location,'存放位置');
+      medMsg('已匹配家庭药箱记录：'+(filled.join('、')||'全部字段')+'（请核对）');
+    }else if(r.found==='online'){
+      const d=r.data;
+      set('mf_name',d.name,'名称');set('mf_spec',d.spec,'规格');
+      set('mf_manu',d.manufacturer,'厂家');set('mf_appr',d.approval_no,'批准文号');
+      medMsg('药品库匹配：'+(filled.join('、')||d.raw_title||'')+'（请核对，未识别的字段可手动补充）');
+    }else{
+      medMsg('未查到该条码（'+(r.message||'各库均未收录')+'）。可手动填写信息，保存后全家扫码即可秒出');
+    }
+  }catch(e){medErr(e.message);}
+}
+async function saveMed(){
+  const name=$('mf_name').value.trim();
+  if(!name){medErr('药品名称必填');return;}
+  const b={name,
+    spec:$('mf_spec').value.trim(),
+    expiry_date:$('mf_exp').value.trim(),
+    stock_qty:+$('mf_stock').value||0,
+    unit:$('mf_unit').value.trim()||'盒',
+    daily_dose:+$('mf_dd').value||0,
+    dose_unit:$('mf_du').value.trim()||'片',
+    manufacturer:$('mf_manu').value.trim(),
+    approval_no:$('mf_appr').value.trim(),
+    barcode:($('mf_code').value||'').trim(),
+    location:$('mf_loc').value.trim(),
+    notes:$('mf_notes').value.trim()};
+  try{
+    await api('/medicines',{method:'POST',body:JSON.stringify(b)});
+    ['mf_code','mf_name','mf_spec','mf_exp','mf_stock','mf_unit','mf_dd','mf_du','mf_manu','mf_appr','mf_loc','mf_notes'].forEach(id=>$(id).value='');
+    $('medform').style.display='none';
+    renderMeds();
+  }catch(e){medErr(e.message);}
 }
 async function renderAlerts(){
   const a=await api('/alerts');
@@ -121,5 +226,10 @@ async function renderAlerts(){
 function tab(i,btn){document.querySelectorAll('.tabbar button').forEach(b=>b.classList.remove('act'));btn.classList.add('act');[0,1,2].forEach(k=>$('tab'+k).style.display=k===i?'':'none');}
 if(T)init();
 </script>
+<div id="scanov" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.88);z-index:99;flex-direction:column;align-items:center;justify-content:center">
+  <video id="scanvid" style="width:92%;max-width:480px;border-radius:12px;background:#000" playsinline muted></video>
+  <div style="color:#fff;margin:14px 0;font-size:14px">对准药盒条码 / 本位码，识别后自动填充</div>
+  <button style="width:auto;padding:10px 28px" onclick="stopScan()">关闭扫码</button>
+</div>
 </body>
 </html>

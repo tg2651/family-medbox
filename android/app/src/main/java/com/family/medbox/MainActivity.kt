@@ -536,6 +536,7 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
     var notes by remember { mutableStateOf("") }
     var imageUrl by remember { mutableStateOf("") }
     var manufacturer by remember { mutableStateOf("") }
+    var approvalNo by remember { mutableStateOf("") }
     var barcode by remember { mutableStateOf("") }
     var barcodeHint by remember { mutableStateOf("") }
     var bcBusy by remember { mutableStateOf(false) }
@@ -545,7 +546,7 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
     val scope = rememberCoroutineScope()
     val ctx = LocalContext.current
 
-    // 扫商品条码（EAN-13）→ 本地家庭库/公开条码库查询 → 自动填充
+    // 扫条码（药盒 EAN-13 商品条码 / 药品本位码 86 开头 14 位）→ 本地库/公开库查询 → 自动填充
     val bcCamLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
         if (ok && bcPhotoUri != null) {
             scope.launch {
@@ -554,7 +555,8 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
                     val code = OcrHelper.scanBarcode(ctx, bcPhotoUri!!)
                     if (code.length in 8..14) {
                         barcode = code
-                        barcodeHint = "条码：$code，查询中…"
+                        val codeType = if (code.length == 14 && code.startsWith("86")) "本位码" else "商品条码"
+                        barcodeHint = "$codeType：$code，查询中…"
                         val r = ApiClient.get("/api/medicine/barcode/$code") as JSONObject
                         val filled = mutableListOf<String>()
                         when (r.optString("found")) {
@@ -565,6 +567,7 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
                                     if (spec.isBlank() && m.optString("spec").isNotEmpty()) { spec = m.optString("spec"); filled.add("规格") }
                                     if (expiry.isBlank() && m.optString("expiry_date").isNotEmpty()) { expiry = m.optString("expiry_date"); filled.add("有效期") }
                                     if (manufacturer.isBlank() && m.optString("manufacturer").isNotEmpty()) { manufacturer = m.optString("manufacturer"); filled.add("厂家") }
+                                    if (approvalNo.isBlank() && m.optString("approval_no").isNotEmpty()) { approvalNo = m.optString("approval_no"); filled.add("批准文号") }
                                     if (dailyDose.isBlank() && m.optDouble("daily_dose") > 0) { dailyDose = fmtNum(m.optDouble("daily_dose")); filled.add("日用量") }
                                     if (doseUnit.isBlank() || doseUnit == "片") { val du = m.optString("dose_unit"); if (du.isNotEmpty()) { doseUnit = du; filled.add("剂量单位") } }
                                     if (m.optString("image_url").isNotEmpty() && imageUrl.isEmpty()) imageUrl = m.optString("image_url")
@@ -577,14 +580,15 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
                                     if (name.isBlank() && d.optString("name").isNotEmpty()) { name = d.optString("name"); filled.add("名称") }
                                     if (spec.isBlank() && d.optString("spec").isNotEmpty()) { spec = d.optString("spec"); filled.add("规格") }
                                     if (manufacturer.isBlank() && d.optString("manufacturer").isNotEmpty()) { manufacturer = d.optString("manufacturer"); filled.add("厂家") }
-                                    barcodeHint = if (filled.isNotEmpty()) "公开条码库匹配：${filled.joinToString("、")}（请核对，未识别的字段可拍照识别补充）"
-                                                  else "公开条码库返回：${d.optString("raw_title")}（请核对）"
+                                    if (approvalNo.isBlank() && d.optString("approval_no").isNotEmpty()) { approvalNo = d.optString("approval_no"); filled.add("批准文号") }
+                                    barcodeHint = if (filled.isNotEmpty()) "本地药品库匹配：${filled.joinToString("、")}（请核对，未识别的字段可拍照识别补充）"
+                                                  else "本地药品库返回：${d.optString("raw_title")}（请核对）"
                                 }
                             }
                             else -> barcodeHint = "条码已记录保存。${r.optString("message")}；建议用「拍照录入」AI 识别药盒补充信息，保存后全家扫码即可秒出全部信息"
                         }
                     } else {
-                        barcodeHint = "未识别到商品条码，请对准药盒侧面的条形码重新扫描"
+                        barcodeHint = "未识别到有效条码，请对准药盒侧面的商品条码（EAN-13）或本位码条码重新扫描"
                     }
                 } catch (e: Exception) { barcodeHint = "扫码失败：${e.message}" }
                 bcBusy = false
@@ -623,7 +627,7 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
                 )
                 if (ocrHint.isNotEmpty()) Text(ocrHint, fontSize = 12.sp, color = Gray, modifier = Modifier.padding(top = 4.dp))
                 Spacer(Modifier.height(8.dp))
-                // 扫商品条码（EAN-13）自动录入
+                // 扫条码（商品条码 EAN-13 / 本位码）自动录入
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     OutlinedButton(onClick = {
                         if (ContextCompat.checkSelfPermission(ctx, android.Manifest.permission.CAMERA) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
@@ -636,7 +640,7 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
                     }
                     if (barcode.isNotEmpty()) {
                         Spacer(Modifier.width(8.dp))
-                        Text(barcode, fontSize = 12.sp, color = Blue)
+                        Text(if (barcode.length == 14 && barcode.startsWith("86")) "本位码 $barcode" else barcode, fontSize = 12.sp, color = Blue)
                     }
                 }
                 if (barcodeHint.isNotEmpty()) Text(barcodeHint, fontSize = 12.sp, color = Gray, modifier = Modifier.padding(top = 4.dp))
@@ -648,6 +652,9 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
                     modifier = Modifier.fillMaxWidth(), singleLine = true)
                 Spacer(Modifier.height(6.dp))
                 OutlinedTextField(manufacturer, { manufacturer = it }, label = { Text("生产厂家（选填）") },
+                    modifier = Modifier.fillMaxWidth(), singleLine = true)
+                Spacer(Modifier.height(6.dp))
+                OutlinedTextField(approvalNo, { approvalNo = it }, label = { Text("批准文号 / 本位码（选填）") },
                     modifier = Modifier.fillMaxWidth(), singleLine = true)
                 Spacer(Modifier.height(6.dp))
                 OutlinedTextField(expiry, { expiry = it }, label = { Text("有效期至（2026-12-31）") },
@@ -692,6 +699,7 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
                             .put("dose_unit", doseUnit.trim()).put("location", location.trim())
                             .put("notes", notes.trim()).put("image_url", imageUrl)
                             .put("barcode", barcode).put("manufacturer", manufacturer.trim())
+                            .put("approval_no", approvalNo.trim())
                         if (userId >= 0) body.put("user_id", userId)
                         ApiClient.post("/api/medicines", body)
                         onClose()

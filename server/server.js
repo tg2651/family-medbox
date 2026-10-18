@@ -16,6 +16,7 @@ db.exec('PRAGMA journal_mode = WAL');
 try { db.exec('ALTER TABLE medicines ADD COLUMN image_url TEXT DEFAULT \'\''); } catch (e) {}
 try { db.exec('ALTER TABLE medicines ADD COLUMN barcode TEXT DEFAULT \'\''); } catch (e) {}
 try { db.exec('ALTER TABLE medicines ADD COLUMN manufacturer TEXT DEFAULT \'\''); } catch (e) {}
+try { db.exec('ALTER TABLE medicines ADD COLUMN approval_no TEXT DEFAULT \'\''); } catch (e) {}
 
 // 设置表（键值对）
 db.exec(`CREATE TABLE IF NOT EXISTS settings (
@@ -113,6 +114,7 @@ CREATE TABLE IF NOT EXISTS medicines (
   image_url TEXT DEFAULT '',
   barcode TEXT DEFAULT '',
   manufacturer TEXT DEFAULT '',
+  approval_no TEXT DEFAULT '',
   created_at TEXT DEFAULT (datetime('now','localtime'))
 );
 CREATE TABLE IF NOT EXISTS schedules(
@@ -405,13 +407,13 @@ app.get('/api/medicine/barcode/:code', requireAuth, async (req, res) => {
 });
 
 app.post('/api/medicines', requireAuth, (req, res) => {
-  const { name, spec, category, expiry_date, stock_qty, unit, daily_dose, dose_unit, location, notes, image_url, barcode, manufacturer } = req.body;
+  const { name, spec, category, expiry_date, stock_qty, unit, daily_dose, dose_unit, location, notes, image_url, barcode, manufacturer, approval_no } = req.body;
   if (!name) return bad(res, '药品名称必填');
   let uid = req.user.id;
   if (req.body.user_id && req.user.role === 'admin') uid = +req.body.user_id;
-  const info = db.prepare(`INSERT INTO medicines(family_id,user_id,name,spec,category,expiry_date,stock_qty,unit,daily_dose,dose_unit,location,notes,image_url,barcode,manufacturer)
-    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .run(req.user.family_id, uid, name, spec || '', category || '', expiry_date || '', +stock_qty || 0, unit || '盒', +daily_dose || 0, dose_unit || '片', location || '', notes || '', image_url || '', barcode || '', manufacturer || '');
+  const info = db.prepare(`INSERT INTO medicines(family_id,user_id,name,spec,category,expiry_date,stock_qty,unit,daily_dose,dose_unit,location,notes,image_url,barcode,manufacturer,approval_no)
+    VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .run(req.user.family_id, uid, name, spec || '', category || '', expiry_date || '', +stock_qty || 0, unit || '盒', +daily_dose || 0, dose_unit || '片', location || '', notes || '', image_url || '', barcode || '', manufacturer || '', approval_no || '');
   res.json({ id: Number(info.lastInsertRowid) });
 });
 
@@ -419,7 +421,7 @@ app.patch('/api/medicines/:id', requireAuth, (req, res) => {
   const m = db.prepare('SELECT * FROM medicines WHERE id=?').get(req.params.id);
   if (!m || m.family_id !== req.user.family_id) return bad(res, '药品不存在');
   if (m.user_id !== req.user.id && req.user.role !== 'admin') return bad(res, '无权限');
-  const f = ['name', 'spec', 'category', 'expiry_date', 'stock_qty', 'unit', 'daily_dose', 'dose_unit', 'location', 'notes', 'image_url', 'barcode', 'manufacturer'];
+  const f = ['name', 'spec', 'category', 'expiry_date', 'stock_qty', 'unit', 'daily_dose', 'dose_unit', 'location', 'notes', 'image_url', 'barcode', 'manufacturer', 'approval_no'];
   const sets = [], vals = [];
   for (const k of f) if (req.body[k] !== undefined) { sets.push(`${k}=?`); vals.push(req.body[k]); }
   if (sets.length) db.prepare(`UPDATE medicines SET ${sets.join(',')} WHERE id=?`).run(...vals, m.id);
