@@ -287,9 +287,30 @@ app.post('/api/ai/recognize', requireAuth, async (req, res) => {
     const buf = Buffer.from(data, 'base64');
     if (buf.length > 8 * 1024 * 1024) return bad(res, '图片过大（限 8MB）');
     const r = type === 'prescription' ? await ai.recognizePrescription(data) : await ai.recognizeMedicine(data);
+    // 用本地药品库（药监局本位码数据集）按名称补全 AI 未识别出的字段
+    enrichFromCatalog(r);
     res.json(r);
   } catch (e) { bad(res, e.message || 'AI识别失败'); }
 });
+
+// 名称匹配本地药品库，补全规格/厂家/批准文号（不覆盖 AI 已识别内容）
+function enrichFromCatalog(r) {
+  if (!r || !r.name) return r;
+  const q = String(r.name).trim();
+  if (q.length < 2) return r;
+  let hit = null;
+  try {
+    hit = db.prepare("SELECT * FROM drug_catalog WHERE name=? AND spec!='' LIMIT 1").get(q);
+    if (!hit) hit = db.prepare("SELECT * FROM drug_catalog WHERE name LIKE ? AND spec!='' LIMIT 1").get(q + '%');
+    if (!hit) hit = db.prepare("SELECT * FROM drug_catalog WHERE ? LIKE name || '%' AND spec!='' LIMIT 1").get(q);
+  } catch (e) { return r; }
+  if (!hit) return r;
+  if (!r.spec && hit.spec) r.spec = hit.spec;
+  if (!r.manufacturer && hit.manufacturer) r.manufacturer = hit.manufacturer;
+  if (!r.approval_no && hit.approval_no) r.approval_no = hit.approval_no;
+  if (!r.raw) r.raw = hit.name + '（' + hit.approval_no + '）';
+  return r;
+}
 
 // --- 药品条码（EAN-13等）查询 ---
 // 查询顺序：1) 本家庭已录入的相同条码药品  2) 后台配置的自定义接口（可选）  3) UPCItemDB（免费无key）  4) OpenProductsFacts（免费无key）
