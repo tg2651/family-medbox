@@ -111,7 +111,7 @@ fun RemoteImage(url: String, modifier: Modifier = Modifier, contentScale: Conten
 
 /** 药品拍照录入按钮：拍照→上传→返回图片 url */
 @Composable
-private fun MedPhotoPicker(imageUrl: String?, onResult: (imageUrl: String, ocr: MedOcrResult?) -> Unit, onClear: () -> Unit) {
+private fun MedPhotoPicker(imageUrl: String?, onResult: (imageUrl: String, ocr: MedOcrResult?, source: String) -> Unit, onClear: () -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     var photoUri by remember { mutableStateOf<Uri?>(null) }
@@ -125,31 +125,36 @@ private fun MedPhotoPicker(imageUrl: String?, onResult: (imageUrl: String, ocr: 
                 busy = true; err = ""
                 try {
                     val b64 = imageToBase64(ctx, photoUri!!)
+                    var ocr: MedOcrResult? = null
+                    var source = ""
                     // 优先服务端 AI 识别
                     busyText = "AI识别中…"
-                    var ocr: MedOcrResult? = null
                     try {
                         val r = ApiClient.post("/api/ai/recognize",
                             JSONObject().put("image", b64).put("type", "medicine")) as JSONObject
-                        if (r.optString("name").isNotEmpty() || r.optString("spec").isNotEmpty()) {
-                            ocr = MedOcrResult(
-                                name = r.optString("name"),
-                                spec = r.optString("spec"),
-                                expiry = r.optString("expiry_date"),
-                                rawText = r.optString("raw")
-                            )
+                        val aiName = r.optString("name")
+                        val aiSpec = r.optString("spec")
+                        val aiExpiry = r.optString("expiry_date")
+                        val aiRaw = r.optString("raw")
+                        if (aiName.isNotEmpty() || aiSpec.isNotEmpty() || aiExpiry.isNotEmpty()) {
+                            ocr = MedOcrResult(name = aiName, spec = aiSpec, expiry = aiExpiry, rawText = aiRaw)
+                            source = "AI"
+                        } else if (aiRaw.isNotBlank()) {
+                            // AI 返回了文本但未结构化 → 用本地解析器兜底
+                            ocr = OcrHelper.parseMedLabel(aiRaw)
+                            source = "AI+本地解析"
                         }
                     } catch (_: Exception) {
                         // AI 不可用 → 降级本地 OCR
                         try {
                             val text = OcrHelper.recognize(ctx, photoUri!!)
-                            if (text.isNotBlank()) ocr = OcrHelper.parseMedLabel(text)
+                            if (text.isNotBlank()) { ocr = OcrHelper.parseMedLabel(text); source = "本地OCR" }
                         } catch (_: Exception) { }
                     }
                     // 上传图片
                     busyText = "上传中…"
                     val up = ApiClient.post("/api/upload", JSONObject().put("image", b64)) as JSONObject
-                    onResult(up.getString("url"), ocr)
+                    onResult(up.getString("url"), ocr, source)
                 } catch (e: Exception) { err = e.message ?: "上传失败" }
                 busy = false
             }
@@ -541,7 +546,7 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
                 // 拍照录入（自动识别药品信息）
                 MedPhotoPicker(
                     imageUrl.ifEmpty { null },
-                    onResult = { url, ocr ->
+                    onResult = { url, ocr, source ->
                         imageUrl = url
                         val p = ocr
                         if (p != null) {
@@ -549,7 +554,12 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
                             if (name.isBlank() && p.name.isNotEmpty()) { name = p.name; filled.add("名称") }
                             if (spec.isBlank() && p.spec.isNotEmpty()) { spec = p.spec; filled.add("规格") }
                             if (expiry.isBlank() && p.expiry.isNotEmpty()) { expiry = p.expiry; filled.add("有效期") }
-                            ocrHint = if (filled.isNotEmpty()) "已识别：${filled.joinToString("、")}（请核对）" else "未识别到药品信息，请手动填写"
+                            ocrHint = if (filled.isNotEmpty())
+                                "已识别（$source）：${filled.joinToString("、")}（请核对）"
+                            else
+                                "已识别文字（$source）但未提取到药品字段，请手动填写"
+                        } else {
+                            ocrHint = if (source.isNotEmpty()) "$source 未识别到信息，请手动填写" else "未识别到药品信息，请手动填写"
                         }
                     },
                     onClear = { imageUrl = "" }
