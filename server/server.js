@@ -153,16 +153,15 @@ function todayStr() {
 function daysBetween(a, b) { // a - b 天数
   return Math.floor((new Date(a + 'T00:00:00') - new Date(b + 'T00:00:00')) / 864e5);
 }
-// 开药提醒：按每日用量推算可服天数
+// 开药提醒：库存 ÷ 日用量 = 还能服几天，据此推算下次开药日期
 function refillInfo(m) {
   if (!m.daily_dose || m.daily_dose <= 0 || m.stock_qty == null) return null;
   const days = Math.floor(m.stock_qty / m.daily_dose);
-  return { daysLeft: days, needRefill: days <= 7 };
-}
-function expiryInfo(m) {
-  if (!m.expiry_date) return null;
-  const days = daysBetween(m.expiry_date, todayStr());
-  return { daysLeft: days, nearExpiry: days <= 30, expired: days < 0 };
+  const d = new Date();
+  d.setDate(d.getDate() + days);
+  const p = n => String(n).padStart(2, '0');
+  const nextRefillDate = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+  return { daysLeft: days, needRefill: days <= 7, nextRefillDate };
 }
 function scheduleOccursOn(sc, dateStr) {
   const s = new Date(sc.start_date + 'T00:00:00');
@@ -265,7 +264,7 @@ app.get('/api/medicines', requireAuth, (req, res) => {
     if (req.user.role !== 'admin') return bad(res, '无权限');
     uid = +req.query.user_id;
   }
-  const meds = getUserMedicines(uid).map(m => ({ ...m, refill: refillInfo(m), expiry: expiryInfo(m) }));
+  const meds = getUserMedicines(uid).map(m => ({ ...m, refill: refillInfo(m) }));
   res.json(meds);
 });
 
@@ -430,6 +429,110 @@ app.post('/api/medicines', requireAuth, (req, res) => {
   res.json({ id: Number(info.lastInsertRowid) });
 });
 
+// ---------- 处方批量入库 ----------
+// 把处方上的「24盒 ×(100mg*14片)」换算为可用最小单位总量，日用量=每次剂量×每日次数
+const DEFAULT_TIMES = {
+  1: ['08:00'],
+  2: ['08:00', '20:00'],
+  3: ['08:00', '12:00', '20:00'],
+  4: ['08:00', '12:00', '18:00', '22:00']
+};
+// 根据药名/规格推断最小剂量单位
+function unitFromName(name, spec) {
+  const s = `${name || ''}${spec || ''}`;
+  if (/胶囊/.test(s)) return '粒';
+  if (/颗粒|冲剂/.test(s)) return '袋';
+  if (/丸/.test(s)) return '丸';
+  if (/滴剂|口服液|糖浆|合剂|滴眼液|滴鼻液|滴耳液|ml|毫升/i.test(s)) return 'ml';
+  if (/注射液|注射用|冻干/.test(s)) return '支';
+  if (/栓/.test(s)) return '枚';
+  if (/贴/.test(s)) return '贴';
+  if (/乳膏|软膏|凝胶|气雾剂|喷雾剂/.test(s)) return '支';
+  if (/片/.test(s)) return '片';
+  return '片';
+}
+// 解析规格中的每包装最小单位数量：100mg*14片→14片；5g*18→18袋；30ml→30ml
+function parsePack(spec, fbUnit) {
+  const s = String(spec || '').replace(/\s/g, '');
+  let m = s.match(/\*\s*(\d+(?:\.\d+)?)\s*(片|粒|袋|支|丸|枚|贴|瓶|ml|毫升)?/i);
+  if (m) return { perPack: +m[1], unit: m[2] || fbUnit || '片' };
+  m = s.match(/(\d+(?:\.\d+)?)\s*(ml|毫升)/i);
+  if (m) return { perPack: +m[1], unit: 'ml' };
+  return { perPack: 1, unit: fbUnit || '片' };
+}
+// 解析规格中的单最小单位含量：100mg*14片→{value:100,unit:'mg'}
+function parseStrength(spec) {
+  const m = String(spec || '').match(/(\d+(?:\.\d+)?)\s*(mg|g|μg|ug|ml)/i);
+  if (!m) return null;
+  let v = +m[1], u = m[2].toLowerCase();
+  if (u === 'g') { v *= 1000; u = 'mg'; }
+  if (u === 'ug' || u === 'μg') { v /= 1000; u = 'mg'; }
+  return { value: v, unit: u };
+}
+
+app.post('/api/prescriptions/import', requireAuth, (req, res) => {
+  const items = Array.isArray(req.body.meds) ? req.body.meds : [];
+  if (!items.length) return bad(res, '未识别到药品');
+  let uid = req.user.id;
+  if (req.body.user_id && req.user.role === 'admin') uid = +req.body.user_id;
+  const startDate = req.body.start_date || todayStr();
+  const createPlan = req.body.create_schedule !== false;
+  const created = [];
+  db.exec('BEGIN');
+  try {
+    for (const it of items) {
+      const name = String(it.name || '').trim();
+      if (!name) continue;
+      const spec = String(it.spec || '').trim();
+      const fbUnit = unitFromName(name, spec);
+      const pack = parsePack(spec, fbUnit);
+      const packQty = Number(it.pack_qty) || 0;
+      // 总库存换算成最小单位（片/粒/袋/ml）
+      const totalStock = packQty > 0 ? +(packQty * pack.perPack).toFixed(2) : (Number(it.stock_qty) || 0);
+      // 每次剂量换算成最小单位（如 400mg ÷ 100mg/片 = 4片）
+      let dosePerTime = Number(it.dose_per_time) || 0;
+      let doseUnit = String(it.dose_unit || '').trim() || pack.unit;
+      const st = parseStrength(spec);
+      if (dosePerTime > 0 && st && doseUnit.toLowerCase() === st.unit && doseUnit.toLowerCase() !== pack.unit.toLowerCase()) {
+        dosePerTime = +(dosePerTime / st.value).toFixed(2);
+        doseUnit = pack.unit;
+      }
+      const timesPerDay = Math.max(0, Number(it.times_per_day) || 0);
+      const dailyDose = +(dosePerTime * timesPerDay).toFixed(2);
+      const durationDays = Math.max(0, Number(it.duration_days) || 0);
+      const packUnit = String(it.pack_unit || '盒').trim();
+      const notes = packQty > 0 ? `处方导入：${packQty}${packUnit}${spec ? ' × ' + spec : ''}` : '处方导入';
+      // 用权威库补全厂家/批准文号
+      const extra = enrichFromCatalog({ name, spec }) || {};
+      const info = db.prepare(`INSERT INTO medicines(family_id,user_id,name,spec,stock_qty,unit,daily_dose,dose_unit,notes,manufacturer,approval_no)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
+        .run(req.user.family_id, uid, name, spec, totalStock, pack.unit,
+          dailyDose, doseUnit, notes, extra.manufacturer || '', extra.approval_no || '');
+      const medId = Number(info.lastInsertRowid);
+      // 按用法用量自动建用药计划
+      if (createPlan && timesPerDay > 0 && dosePerTime > 0) {
+        const times = DEFAULT_TIMES[Math.min(4, Math.max(1, Math.round(timesPerDay)))] || DEFAULT_TIMES[4];
+        let endDate = '';
+        if (durationDays > 0) {
+          const d = new Date(startDate + 'T00:00:00');
+          d.setDate(d.getDate() + durationDays - 1);
+          const p = n => String(n).padStart(2, '0');
+          endDate = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+        }
+        db.prepare(`INSERT INTO schedules(family_id,medicine_id,user_id,times,dose_per_time,dose_unit,frequency,interval_days,start_date,end_date)
+          VALUES(?,?,?,?,?,?,?,?,?,?)`)
+          .run(req.user.family_id, medId, uid, JSON.stringify(times), dosePerTime, doseUnit, 'daily', 1, startDate, endDate);
+      }
+      created.push({ id: medId, name, spec, stock_qty: totalStock, unit: pack.unit, daily_dose: dailyDose, dose_unit: doseUnit, times_per_day: timesPerDay, duration_days: durationDays });
+    }
+    db.exec('COMMIT');
+  } catch (e) {
+    db.exec('ROLLBACK');
+    return res.status(500).json({ error: '入库失败：' + e.message });
+  }
+  res.json({ ok: true, count: created.length, meds: created });
+});
+
 app.patch('/api/medicines/:id', requireAuth, (req, res) => {
   const m = db.prepare('SELECT * FROM medicines WHERE id=?').get(req.params.id);
   if (!m || m.family_id !== req.user.family_id) return bad(res, '药品不存在');
@@ -542,22 +645,20 @@ app.post('/api/intake', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
-// --- 预警：低库存（该开药了）与临期 ---
+// --- 预警：按用法用量推算的开药提醒（不再提醒药品过期） ---
 app.get('/api/alerts', requireAuth, (req, res) => {
   let uid = req.query.user_id && req.user.role === 'admin' ? +req.query.user_id : null;
   const meds = uid
     ? getUserMedicines(uid)
     : db.prepare('SELECT * FROM medicines WHERE family_id=?').all(req.user.family_id);
-  const refill = [], expiry = [];
+  const refill = [];
   for (const m of meds) {
     const owner = db.prepare('SELECT display_name FROM users WHERE id=?').get(m.user_id);
-    const r = refillInfo(m), e = expiryInfo(m);
-    if (r && r.needRefill) refill.push({ ...m, owner: owner?.display_name, days_left: r.daysLeft });
-    if (e && (e.expired || e.nearExpiry)) expiry.push({ ...m, owner: owner?.display_name, days_left: e.daysLeft, expired: e.expired });
+    const r = refillInfo(m);
+    if (r && r.needRefill) refill.push({ ...m, owner: owner?.display_name, days_left: r.daysLeft, next_refill_date: r.nextRefillDate });
   }
   refill.sort((a, b) => a.days_left - b.days_left);
-  expiry.sort((a, b) => a.days_left - b.days_left);
-  res.json({ refill, expiry });
+  res.json({ refill });
 });
 
 // --- 管理员总览 ---
@@ -565,7 +666,7 @@ app.get('/api/admin/overview', requireAuth, requireAdmin, (req, res) => {
   const members = db.prepare('SELECT id,username,display_name,role,age,notes,created_at FROM users WHERE family_id=? ORDER BY id').all(req.user.family_id);
   const today = todayStr();
   const result = members.map(m => {
-    const meds = getUserMedicines(m.id).map(md => ({ ...md, refill: refillInfo(md), expiry: expiryInfo(md) }));
+    const meds = getUserMedicines(m.id).map(md => ({ ...md, refill: refillInfo(md) }));
     const scs = getSchedules(m.id);
     // 今日待办统计
     let pending = 0, total = 0;
@@ -580,15 +681,13 @@ app.get('/api/admin/overview', requireAuth, requireAdmin, (req, res) => {
     }
     return { ...m, medicines: meds, schedules: scs, today_total: total, today_pending: pending };
   });
-  const alerts = { refill: [], expiry: [] };
+  const alerts = { refill: [] };
   for (const mem of result) {
     for (const md of mem.medicines) {
-      if (md.refill && md.refill.needRefill) alerts.refill.push({ medicine_id: md.id, name: md.name, owner: mem.display_name, days_left: md.refill.daysLeft, stock_qty: md.stock_qty, unit: md.unit, daily_dose: md.daily_dose });
-      if (md.expiry && (md.expiry.expired || md.expiry.nearExpiry)) alerts.expiry.push({ medicine_id: md.id, name: md.name, owner: mem.display_name, days_left: md.expiry.days_left, expired: md.expiry.expired, expiry_date: md.expiry_date });
+      if (md.refill && md.refill.needRefill) alerts.refill.push({ medicine_id: md.id, name: md.name, owner: mem.display_name, days_left: md.refill.daysLeft, next_refill_date: md.refill.nextRefillDate, stock_qty: md.stock_qty, unit: md.unit, daily_dose: md.daily_dose });
     }
   }
   alerts.refill.sort((a, b) => a.days_left - b.days_left);
-  alerts.expiry.sort((a, b) => a.days_left - b.days_left);
   res.json({ members: result, alerts });
 });
 

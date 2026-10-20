@@ -104,6 +104,9 @@ async function renderMeds(){
   const meds=await api('/medicines');
   $('tab1').innerHTML=`<div class="card"><h1 style="font-size:16px">我的药品（${meds.length}）</h1>
   <button onclick="toggleMedForm()">＋ 扫码添加药品</button>
+  <button style="margin-top:6px;background:#0f766e" onclick="rxPick()">📷 扫描处方入库</button>
+  <input type="file" id="rx_file" accept="image/*" style="display:none" onchange="rxImport(this)">
+  <div class="sub" id="rx_msg" style="margin-top:6px"></div>
   <div id="medform" style="display:none;margin-top:6px">
     <div class="row">
       <input id="mf_code" inputmode="numeric" placeholder="条码/本位码（8-14位数字）">
@@ -115,7 +118,6 @@ async function renderMeds(){
     <input id="mf_spec" placeholder="规格（如 0.25g×24片）">
     <input id="mf_manu" placeholder="生产厂家（选填）">
     <input id="mf_appr" placeholder="批准文号 / 本位码（选填）">
-    <input id="mf_exp" placeholder="有效期至（2026-12-31）">
     <div class="row">
       <input id="mf_stock" inputmode="decimal" placeholder="库存数量">
       <input id="mf_unit" placeholder="单位（盒）">
@@ -129,13 +131,30 @@ async function renderMeds(){
     <button onclick="saveMed()">保存药品</button>
   </div>`+
   (meds.length?meds.map(m=>`<div class="med"><div class="t">${h(m.name)} <span class="sub">${h(m.spec)} ${h(m.category)}</span></div>
-  <div class="sub">余 ${h(m.stock_qty)} ${h(m.unit)} · 日用量 ${h(m.daily_dose)} ${h(m.dose_unit)} ${m.expiry_date?('· 有效期至 '+h(m.expiry_date)):''} ${m.location?('· 存放：'+h(m.location)):''}</div>
+  <div class="sub">余 ${h(m.stock_qty)} ${h(m.unit)} · 日用量 ${h(m.daily_dose)} ${h(m.dose_unit)} ${m.location?('· 存放：'+h(m.location)):''}</div>
   ${m.approval_no?`<div class="sub">批准文号：${h(m.approval_no)}${m.barcode?(' · 条码 '+h(m.barcode)):''}</div>`:''}
-  ${m.refill&&m.refill.needRefill?`<div class="warn">库存仅够 ${m.refill.daysLeft} 天，该开药了</div>`:''}
-  ${m.expiry&&m.expiry.expired?'<div class="bad">已过期，请勿服用</div>':(m.expiry&&m.expiry.nearExpiry?`<div class="warn">${m.expiry.daysLeft} 天后到期</div>`:'')}</div>`).join('')
+  ${m.refill&&m.refill.needRefill?`<div class="warn">库存仅够 ${m.refill.daysLeft} 天，${m.refill.nextRefillDate?h(m.refill.nextRefillDate)+' 前该开药了':'该开药了'}</div>`:(m.refill&&m.refill.nextRefillDate?`<div class="sub">预计 ${h(m.refill.nextRefillDate)} 需开药</div>`:'')}</div>`).join('')
   :'<div class="sub">暂无药品，点上方按钮扫码或手动添加</div>')+'</div>';
 }
 let medStream=null;
+// 扫描/上传医生处方 → AI 识别全部药品规格数量 → 批量入库并按用法用量建提醒
+function rxPick(){const f=$('rx_file');if(!f)return;f.value='';f.click();}
+function rxFileToBase64(file){return new Promise((res,rej)=>{const r=new FileReader();r.onload=()=>res(String(r.result||'').split(',')[1]||'');r.onerror=rej;r.readAsDataURL(file);});}
+async function rxImport(inp){
+  const file=inp.files&&inp.files[0];if(!file)return;
+  const msg=$('rx_msg');msg.style.color='';msg.textContent='AI 识别处方中，请稍候…';
+  try{
+    const b64=await rxFileToBase64(file);
+    const r=await api('/ai/recognize',{method:'POST',body:JSON.stringify({image:b64,type:'prescription'})});
+    const meds=r.meds||[];
+    if(!meds.length){msg.textContent='未识别到药品，请换一张更清晰的照片';return;}
+    const lines=meds.map((m,i)=>`${i+1}. ${m.name}　规格 ${m.spec||'-'}　${m.pack_qty}${m.pack_unit}　用法 ${m.dose_per_time}${m.dose_unit}/次，每日 ${m.times_per_day} 次${m.duration_days?('，共'+m.duration_days+'天'):''}`).join('\n');
+    if(!confirm('识别到 '+meds.length+' 种药品：\n\n'+lines+'\n\n确认全部入库并创建每日用药提醒？')){msg.textContent='已取消';return;}
+    const res=await api('/prescriptions/import',{method:'POST',body:JSON.stringify({meds,create_schedule:true})});
+    renderMeds();
+    const m2=$('rx_msg');if(m2){m2.style.color='var(--ok)';m2.textContent='已入库 '+res.count+' 种药品，并已按用法用量创建每日提醒';}
+  }catch(e){msg.textContent=e.message;msg.style.color='var(--bad)';}
+}
 function toggleMedForm(){const f=$('medform');f.style.display=f.style.display==='none'?'':'none';if(f.style.display==='none')stopScan();}
 function medMsg(s){const e=$('mf_msg');if(e){e.textContent=s;e.style.color='';}}
 function medErr(s){const e=$('mf_msg');if(e){e.textContent=s;e.style.color='var(--bad)';}}
@@ -176,7 +195,7 @@ async function medLookup(){
     const set=(id,v,tag)=>{if(v!==''&&v!=null&&$(id).value===''){$(id).value=v;filled.push(tag);}};
     if(r.found==='local'){
       const m=r.medicine;
-      set('mf_name',m.name,'名称');set('mf_spec',m.spec,'规格');set('mf_exp',m.expiry_date,'有效期');
+      set('mf_name',m.name,'名称');set('mf_spec',m.spec,'规格');
       set('mf_manu',m.manufacturer,'厂家');set('mf_appr',m.approval_no,'批准文号');
       set('mf_stock',m.stock_qty!=null?String(m.stock_qty):'','库存');set('mf_unit',m.unit,'单位');
       set('mf_dd',m.daily_dose!=null?String(m.daily_dose):'','日用量');set('mf_du',m.dose_unit,'剂量单位');
@@ -197,7 +216,6 @@ async function saveMed(){
   if(!name){medErr('药品名称必填');return;}
   const b={name,
     spec:$('mf_spec').value.trim(),
-    expiry_date:$('mf_exp').value.trim(),
     stock_qty:+$('mf_stock').value||0,
     unit:$('mf_unit').value.trim()||'盒',
     daily_dose:+$('mf_dd').value||0,
@@ -209,7 +227,7 @@ async function saveMed(){
     notes:$('mf_notes').value.trim()};
   try{
     await api('/medicines',{method:'POST',body:JSON.stringify(b)});
-    ['mf_code','mf_name','mf_spec','mf_exp','mf_stock','mf_unit','mf_dd','mf_du','mf_manu','mf_appr','mf_loc','mf_notes'].forEach(id=>$(id).value='');
+    ['mf_code','mf_name','mf_spec','mf_stock','mf_unit','mf_dd','mf_du','mf_manu','mf_appr','mf_loc','mf_notes'].forEach(id=>$(id).value='');
     $('medform').style.display='none';
     renderMeds();
   }catch(e){medErr(e.message);}

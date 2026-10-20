@@ -423,6 +423,7 @@ fun MedsTab(user: JSONObject, userId: Int = -1, readOnly: Boolean = false) {
     var meds by remember { mutableStateOf<List<JSONObject>>(emptyList()) }
     var err by remember { mutableStateOf("") }
     var showAdd by remember { mutableStateOf(false) }
+    var showRx by remember { mutableStateOf(false) }
     var editMed by remember { mutableStateOf<JSONObject?>(null) }
     var delMed by remember { mutableStateOf<JSONObject?>(null) }
     val scope = rememberCoroutineScope()
@@ -438,8 +439,14 @@ fun MedsTab(user: JSONObject, userId: Int = -1, readOnly: Boolean = false) {
     Column(Modifier.fillMaxSize().padding(16.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("我的药品（${meds.size}）", fontSize = 22.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-            if (!readOnly) Button(onClick = { showAdd = true }) {
-                Icon(Icons.Filled.Add, null); Text("添加")
+            if (!readOnly) {
+                OutlinedButton(onClick = { showRx = true }, contentPadding = PaddingValues(horizontal = 10.dp)) {
+                    Text("处方入库", fontSize = 13.sp)
+                }
+                Spacer(Modifier.width(6.dp))
+                Button(onClick = { showAdd = true }) {
+                    Icon(Icons.Filled.Add, null); Text("添加")
+                }
             }
         }
         Spacer(Modifier.height(8.dp))
@@ -453,6 +460,7 @@ fun MedsTab(user: JSONObject, userId: Int = -1, readOnly: Boolean = false) {
     }
 
     if (showAdd) AddMedDialog(userId) { showAdd = false; scope.launch { load() } }
+    if (showRx) PrescriptionImportDialog(userId) { showRx = false; scope.launch { load() } }
     editMed?.let { m ->
         EditStockDialog(m) {
             editMed = null
@@ -480,7 +488,6 @@ fun MedsTab(user: JSONObject, userId: Int = -1, readOnly: Boolean = false) {
 @Composable
 private fun MedCard(m: JSONObject, readOnly: Boolean, onEdit: () -> Unit, onDelete: () -> Unit) {
     val refill = m.optJSONObject("refill")
-    val expiry = m.optJSONObject("expiry")
     Card(Modifier.fillMaxWidth().padding(vertical = 5.dp)) {
         Row(Modifier.padding(14.dp), verticalAlignment = Alignment.Top) {
             if (m.optString("image_url").isNotEmpty()) {
@@ -493,9 +500,7 @@ private fun MedCard(m: JSONObject, readOnly: Boolean, onEdit: () -> Unit, onDele
             Column(Modifier.weight(1f)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(m.optString("name"), fontSize = 19.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                if (expiry?.optBoolean("expired") == true)
-                    Text("已过期", color = Red, fontWeight = FontWeight.Bold, fontSize = 14.sp)
-                else if (refill?.optBoolean("needRefill") == true)
+                if (refill?.optBoolean("needRefill") == true)
                     Text("该开药了", color = Orange, fontWeight = FontWeight.Bold, fontSize = 14.sp)
             }
             if (m.optString("spec").isNotEmpty()) Text(m.optString("spec"), fontSize = 14.sp, color = Gray)
@@ -503,18 +508,11 @@ private fun MedCard(m: JSONObject, readOnly: Boolean, onEdit: () -> Unit, onDele
                 "余 ${fmtNum(m.optDouble("stock_qty"))} ${m.optString("unit", "盒")} · 日用量 ${fmtNum(m.optDouble("daily_dose"))} ${m.optString("dose_unit", "片")}",
                 fontSize = 15.sp
             )
-            if (m.optString("expiry_date").isNotEmpty())
-                Text(
-                    "有效期至 ${m.optString("expiry_date")}" +
-                        (if (expiry != null && expiry.optBoolean("nearExpiry") && !expiry.optBoolean("expired"))
-                            "（${expiry.optInt("days_left")} 天后到期）" else ""),
-                    fontSize = 14.sp,
-                    color = if (expiry?.optBoolean("expired") == true) Red
-                        else if (expiry?.optBoolean("nearExpiry") == true) Orange else Gray
-                )
             if (m.optString("location").isNotEmpty()) Text("存放：${m.optString("location")}", fontSize = 14.sp, color = Gray)
             if (refill?.optBoolean("needRefill") == true)
-                Text("⚠ 库存仅够服 ${refill.optInt("daysLeft")} 天，请及时开药", color = Orange, fontSize = 15.sp)
+                Text("⚠ 库存仅够服 ${refill.optInt("daysLeft")} 天（${refill.optString("nextRefillDate")} 需开药）", color = Orange, fontSize = 15.sp)
+            else if (refill != null)
+                Text("预计 ${refill.optString("nextRefillDate")} 需开药", color = Gray, fontSize = 13.sp)
             if (!readOnly) Row {
                 TextButton(onClick = onEdit) { Text("改库存", fontSize = 14.sp) }
                 TextButton(onClick = onDelete) { Text("删除", color = Red, fontSize = 14.sp) }
@@ -524,11 +522,125 @@ private fun MedCard(m: JSONObject, readOnly: Boolean, onEdit: () -> Unit, onDele
     }
 }
 
+/** 扫描医生处方 → AI 识别全部药品规格与数量 → 批量入库并按用法用量建提醒 */
+@Composable
+private fun PrescriptionImportDialog(userId: Int, onClose: () -> Unit) {
+    var busy by remember { mutableStateOf(false) }
+    var hint by remember { mutableStateOf("拍摄处方照片，自动识别全部药品、规格、数量与用法用量") }
+    var rxItems by remember { mutableStateOf<List<JSONObject>>(emptyList()) }
+    var qtys by remember { mutableStateOf<List<String>>(emptyList()) }
+    var createPlan by remember { mutableStateOf(true) }
+    var photoUri by remember { mutableStateOf<Uri?>(null) }
+    var err by remember { mutableStateOf("") }
+    val scope = rememberCoroutineScope()
+    val ctx = LocalContext.current
+
+    val camLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
+        if (ok && photoUri != null) {
+            scope.launch {
+                busy = true; hint = "AI 识别处方中…"; err = ""
+                try {
+                    val b64 = imageToBase64(ctx, photoUri!!)
+                    val r = ApiClient.post("/api/ai/recognize",
+                        JSONObject().put("image", b64).put("type", "prescription"), 120000) as JSONObject
+                    val arr = r.optJSONArray("meds") ?: JSONArray()
+                    rxItems = arr.objs()
+                    qtys = rxItems.map { fmtNum(it.optDouble("pack_qty")) }
+                    hint = if (rxItems.isEmpty()) "未识别到药品，请重拍或改用「添加」手动录入"
+                           else "识别到 ${rxItems.size} 种药品，请核对数量后入库"
+                } catch (e: Exception) { hint = "识别失败：${e.message}" }
+                busy = false
+            }
+        }
+    }
+    val permLauncher = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
+        if (it) { val u = newPhotoUri(ctx); photoUri = u; camLauncher.launch(u) }
+    }
+
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = { Text("扫描处方入库") },
+        text = {
+            Column(Modifier.heightIn(max = 460.dp).verticalScroll(rememberScrollState())) {
+                Text(hint, fontSize = 13.sp, color = Gray)
+                Spacer(Modifier.height(10.dp))
+                Button(
+                    onClick = {
+                        val granted = ContextCompat.checkSelfPermission(ctx, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED
+                        if (granted) { val u = newPhotoUri(ctx); photoUri = u; camLauncher.launch(u) }
+                        else permLauncher.launch(Manifest.permission.CAMERA)
+                    },
+                    enabled = !busy, modifier = Modifier.fillMaxWidth()
+                ) { Text(if (busy) "识别中…" else "拍摄处方照片") }
+                if (rxItems.isNotEmpty()) {
+                    Spacer(Modifier.height(10.dp))
+                    rxItems.forEachIndexed { i, it ->
+                        val times = it.optInt("times_per_day")
+                        val dose = it.optDouble("dose_per_time")
+                        val du = it.optString("dose_unit", "片")
+                        val days = it.optInt("duration_days")
+                        Card(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                            Column(Modifier.padding(10.dp)) {
+                                Text(it.optString("name"), fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                                if (it.optString("spec").isNotEmpty())
+                                    Text("规格 ${it.optString("spec")}", fontSize = 13.sp, color = Gray)
+                                if (dose > 0 && times > 0)
+                                    Text("用法 ${fmtNum(dose)}$du/次 · 每日 $times 次" + if (days > 0) " · $days 天" else "",
+                                        fontSize = 13.sp, color = Gray)
+                                Row(verticalAlignment = Alignment.CenterVertically) {
+                                    Text("数量", fontSize = 13.sp, color = Gray)
+                                    Spacer(Modifier.width(6.dp))
+                                    OutlinedTextField(
+                                        qtys.getOrElse(i) { "" },
+                                        { v -> qtys = qtys.toMutableList().also { l -> while (l.size <= i) l.add(""); l[i] = v } },
+                                        modifier = Modifier.width(80.dp), singleLine = true
+                                    )
+                                    Text(" ${it.optString("pack_unit", "盒")}", fontSize = 13.sp, color = Gray)
+                                }
+                            }
+                        }
+                    }
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(checked = createPlan, onCheckedChange = { createPlan = it })
+                        Text("同时创建每日用药提醒", fontSize = 14.sp)
+                    }
+                    Text("入库后按「每次剂量 × 每日次数」自动计算日用量，库存不足 7 天时提醒开药。",
+                        fontSize = 12.sp, color = Gray)
+                }
+                if (err.isNotEmpty()) { Spacer(Modifier.height(6.dp)); Text(err, color = Red, fontSize = 13.sp) }
+            }
+        },
+        confirmButton = {
+            TextButton(
+                enabled = rxItems.isNotEmpty() && !busy,
+                onClick = {
+                    scope.launch {
+                        busy = true; err = ""
+                        try {
+                            val arr = JSONArray()
+                            rxItems.forEachIndexed { i, it ->
+                                val q = JSONObject(it.toString())
+                                q.put("pack_qty", qtys.getOrElse(i) { "" }.toDoubleOrNull() ?: 0.0)
+                                arr.put(q)
+                            }
+                            val body = JSONObject().put("meds", arr).put("create_schedule", createPlan)
+                            if (userId >= 0) body.put("user_id", userId)
+                            ApiClient.post("/api/prescriptions/import", body, 30000)
+                            onClose()
+                        } catch (e: Exception) { err = e.message ?: "入库失败" }
+                        busy = false
+                    }
+                }
+            ) { Text("全部入库") }
+        },
+        dismissButton = { TextButton(onClick = onClose) { Text("关闭") } }
+    )
+}
+
 @Composable
 private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
     var name by remember { mutableStateOf("") }
     var spec by remember { mutableStateOf("") }
-    var expiry by remember { mutableStateOf("") }
     var stock by remember { mutableStateOf("") }
     var unit by remember { mutableStateOf("盒") }
     var dailyDose by remember { mutableStateOf("") }
@@ -566,7 +678,6 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
                                 if (m != null) {
                                     if (name.isBlank() && m.optString("name").isNotEmpty()) { name = m.optString("name"); filled.add("名称") }
                                     if (spec.isBlank() && m.optString("spec").isNotEmpty()) { spec = m.optString("spec"); filled.add("规格") }
-                                    if (expiry.isBlank() && m.optString("expiry_date").isNotEmpty()) { expiry = m.optString("expiry_date"); filled.add("有效期") }
                                     if (manufacturer.isBlank() && m.optString("manufacturer").isNotEmpty()) { manufacturer = m.optString("manufacturer"); filled.add("厂家") }
                                     if (approvalNo.isBlank() && m.optString("approval_no").isNotEmpty()) { approvalNo = m.optString("approval_no"); filled.add("批准文号") }
                                     if (dailyDose.isBlank() && m.optDouble("daily_dose") > 0) { dailyDose = fmtNum(m.optDouble("daily_dose")); filled.add("日用量") }
@@ -620,7 +731,6 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
                             val filled = mutableListOf<String>()
                             if (name.isBlank() && p.name.isNotEmpty()) { name = p.name; filled.add("名称") }
                             if (spec.isBlank() && p.spec.isNotEmpty()) { spec = p.spec; filled.add("规格") }
-                            if (expiry.isBlank() && p.expiry.isNotEmpty()) { expiry = p.expiry; filled.add("有效期") }
                             if (approvalNo.isBlank() && p.approval.isNotEmpty()) { approvalNo = p.approval; filled.add("批准文号") }
                             // 根据识别的规格自动推断日用量单位（如 胶囊→粒、颗粒→袋、口服液→支）
                             if ((doseUnit.isBlank() || doseUnit == "片") && p.spec.isNotEmpty()) {
@@ -677,9 +787,6 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
                 OutlinedTextField(approvalNo, { approvalNo = it }, label = { Text("批准文号 / 本位码（选填）") },
                     modifier = Modifier.fillMaxWidth(), singleLine = true)
                 Spacer(Modifier.height(6.dp))
-                OutlinedTextField(expiry, { expiry = it }, label = { Text("有效期至（2026-12-31）") },
-                    modifier = Modifier.fillMaxWidth(), singleLine = true)
-                Spacer(Modifier.height(8.dp))
                 Text("日用量（用于推算何时该开药）", fontSize = 13.sp, color = Gray)
                 Spacer(Modifier.height(2.dp))
                 Row(Modifier.fillMaxWidth()) {
@@ -705,7 +812,6 @@ private fun AddMedDialog(userId: Int, onClose: () -> Unit) {
                     try {
                         val body = JSONObject()
                             .put("name", name.trim()).put("spec", spec.trim())
-                            .put("expiry_date", expiry.trim())
                             .put("stock_qty", stock.toDoubleOrNull() ?: 0.0)
                             .put("unit", unit.trim()).put("daily_dose", dailyDose.toDoubleOrNull() ?: 0.0)
                             .put("dose_unit", doseUnit.trim()).put("location", location.trim())
@@ -1115,11 +1221,10 @@ fun AdminScreen(admin: JSONObject, onBack: () -> Unit) {
     }
 }
 
-/** 全家开药/效期预警 */
+/** 全家开药提醒（按处方用法用量推算） */
 @Composable
 private fun AlertsPanel(overview: JSONObject) {
     val refill = overview.optJSONObject("alerts")?.optJSONArray("refill")?.objs() ?: emptyList()
-    val expiry = overview.optJSONObject("alerts")?.optJSONArray("expiry")?.objs() ?: emptyList()
     LazyColumn(Modifier.fillMaxSize().padding(16.dp)) {
         item {
             Text("该开药了（按日用量估算 ≤7 天）", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Orange)
@@ -1135,23 +1240,8 @@ private fun AlertsPanel(overview: JSONObject) {
                     }
                     Text("${r.optString("owner")} · 剩 ${fmtNum(r.optDouble("stock_qty"))} ${r.optString("unit")} · 日用 ${fmtNum(r.optDouble("daily_dose"))}",
                         fontSize = 13.sp, color = Gray)
-                }
-            }
-        }
-        item {
-            Spacer(Modifier.height(16.dp))
-            Text("效期预警（≤30 天或已过期）", fontSize = 18.sp, fontWeight = FontWeight.Bold, color = Orange)
-            if (expiry.isEmpty()) Text("暂无预警 ✓", color = Gray, modifier = Modifier.padding(vertical = 8.dp))
-        }
-        items(expiry) { e ->
-            Card(Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-                Column(Modifier.padding(12.dp)) {
-                    Row {
-                        Text(e.optString("name"), fontSize = 17.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
-                        if (e.optBoolean("expired")) Text("已过期", color = Red, fontWeight = FontWeight.Bold)
-                        else Text("${e.optInt("days_left")} 天后到期", color = Orange)
-                    }
-                    Text("${e.optString("owner")} · 有效期至 ${e.optString("expiry_date")}", fontSize = 13.sp, color = Gray)
+                    if (r.optString("next_refill_date").isNotEmpty())
+                        Text("建议 ${r.optString("next_refill_date")} 前开药", fontSize = 13.sp, color = Orange)
                 }
             }
         }

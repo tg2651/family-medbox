@@ -96,10 +96,9 @@ function render(){renderOverview();renderAlerts();renderInvite();renderAiConfig(
 function esc(n){return n}
 function tagFor(m){
   const t=[];
-  const r=m.refill,e=m.expiry;
+  const r=m.refill;
   if(r&&r.needRefill)t.push(`<span class="tag ${r.daysLeft<=3?'bad':'warn'}">该开药了·剩${r.daysLeft}天</span>`);
-  if(e&&e.expired)t.push(`<span class="tag bad">已过期</span>`);
-  else if(e&&e.nearExpiry)t.push(`<span class="tag warn">临期·${e.daysLeft}天</span>`);
+  else if(r&&r.nextRefillDate)t.push(`<span class="tag ok">${r.nextRefillDate} 需开药</span>`);
   if(!t.length)t.push('<span class="tag ok">正常</span>');
   return t.join('');
 }
@@ -116,13 +115,10 @@ function renderOverview(){
   $('tab0').innerHTML=`<div class="grid">${mems}</div>`;
 }
 function renderAlerts(){
-  const r=data.alerts.refill.map(a=>`<tr><td>${h(a.name)}</td><td>${h(a.owner)}</td><td>剩 ${h(a.stock_qty)} ${h(a.unit)}</td><td>日用量 ${h(a.daily_dose)}</td><td><span class="tag ${a.days_left<=3?'bad':'warn'}">还能服 ${a.days_left} 天</span></td></tr>`).join('');
-  const e=data.alerts.expiry.map(a=>`<tr><td>${h(a.name)}</td><td>${h(a.owner)}</td><td>${h(a.expiry_date)}</td><td>${a.expired?'<span class="tag bad">已过期</span>':`<span class="tag warn">${a.days_left}天后到期</span>`}</td></tr>`).join('');
+  const r=data.alerts.refill.map(a=>`<tr><td>${h(a.name)}</td><td>${h(a.owner)}</td><td>剩 ${h(a.stock_qty)} ${h(a.unit)}</td><td>日用量 ${h(a.daily_dose)}</td><td><span class="tag ${a.days_left<=3?'bad':'warn'}">还能服 ${a.days_left} 天</span></td><td>${h(a.next_refill_date||'-')}</td></tr>`).join('');
   $('tab1').innerHTML=`
-  <div class="card" id="alerts"><h3>该开药了（按老人常用药日用量估算，≤7 天预警）</h3>
-    <table class="tbl"><tr><th>药品</th><th>成员</th><th>库存</th><th>日用量</th><th>可服天数</th></tr>${r||'<tr><td colspan="5" class="sub">暂无预警</td></tr>'}</table></div>
-  <div class="card"><h3>效期预警（≤30 天或已过期）</h3>
-    <table class="tbl"><tr><th>药品</th><th>成员</th><th>有效期至</th><th>状态</th></tr>${e||'<tr><td colspan="4" class="sub">暂无预警</td></tr>'}</table></div>`;
+  <div class="card" id="alerts"><h3>该开药了（按处方用法用量推算，剩余不足 7 天预警）</h3>
+    <table class="tbl"><tr><th>药品</th><th>成员</th><th>库存</th><th>日用量</th><th>可服天数</th><th>建议开药日期</th></tr>${r||'<tr><td colspan="6" class="sub">暂无预警</td></tr>'}</table></div>`;
 }
 function renderInvite(){
   $('tab2').innerHTML=`<div class="card"><h3>家庭成员邀请码</h3>

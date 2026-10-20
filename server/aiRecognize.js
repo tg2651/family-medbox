@@ -212,29 +212,47 @@ async function recognizeMedicine(imageBase64) {
 }
 
 async function recognizePrescription(imageBase64) {
-  const system = '你是一名专业的处方识别助手。用户上传医生处方图片，请识别处方中的药品及用法用量，仅返回 JSON，不要输出多余文字。';
-  const user = `请识别处方中的药品信息，仅返回 JSON，结构如下：
+  const system = '你是一名专业的处方识别助手。用户上传医生处方图片，请逐行识别处方中的药品及用法用量，仅返回 JSON，不要输出多余文字。';
+  const user = `请识别处方中每一行药品，仅返回 JSON，结构如下：
 {
+  "patient": "患者姓名，可空",
+  "prescribed_date": "开方日期 YYYY-MM-DD，可空",
   "meds": [
     {
-      "name": "药品名称",
-      "dose_per_time": "每次剂量（纯数字，如 1）",
-      "dose_unit": "剂量单位（片/粒/ml/mg）",
-      "times_per_day": "每日服用次数（数字 1-4）",
-      "duration_days": "用药天数（数字，未知填 0）"
+      "name": "药品名称（去掉规格括注，如 沙库巴曲缬沙坦钠片）",
+      "spec": "规格，如 100mg*14片 / 5g*18袋 / 30ml，可空",
+      "pack_qty": "处方数量数字，如 24",
+      "pack_unit": "数量单位：盒/瓶/袋",
+      "dose_per_time": "每次剂量数字，如 4、1、2",
+      "dose_unit": "每次剂量单位：片/粒/袋/ml/mg",
+      "times_per_day": "每日服用次数数字，如 1、3、4",
+      "duration_days": "用药天数数字，如 84，未知填 0"
     }
   ]
 }
-只识别处方中明确列出的药品，无法识别的字段留空或 0，不要编造。`;
+识别要点：
+1. 处方一行形如「沙库巴曲缬沙坦钠片(100mg*14片) 24盒*42.49 用法:400mg/每次 每日一次*84天 口服」
+   → name=沙库巴曲缬沙坦钠片, spec=100mg*14片, pack_qty=24, pack_unit=盒, dose_per_time=400, dose_unit=mg, times_per_day=1, duration_days=84
+2. 「每日一次」=1、「每日二次」=2、「每日三次」=3、「每日四次」=4。
+3. 若每次剂量单位与包装最小单位不同（如 400mg/每次、规格 100mg/14片），请换算为最小单位数量（400÷100=4 片），dose_unit 填 片。
+4. 同一处方有多行药品时逐行全部返回。
+只返回 JSON，不要编造处方中没有的药品。`;
   const text = await callAI(imageBase64, system, user);
   const j = extractJson(text) || {};
   const meds = Array.isArray(j.meds) ? j.meds : [];
   return {
+    patient: j.patient || '',
+    prescribed_date: j.prescribed_date || '',
     meds: meds.map(m => ({
-      name: m.name || '', dose_per_time: m.dose_per_time || '',
-      dose_unit: m.dose_unit || '片', times_per_day: Number(m.times_per_day) || 0,
+      name: String(m.name || '').replace(/[（(].*?[）)]/g, '').trim(),
+      spec: m.spec || '',
+      pack_qty: Number(m.pack_qty) || 0,
+      pack_unit: m.pack_unit || '盒',
+      dose_per_time: Number(m.dose_per_time) || 0,
+      dose_unit: m.dose_unit || '片',
+      times_per_day: Number(m.times_per_day) || 0,
       duration_days: Number(m.duration_days) || 0
-    })),
+    })).filter(m => m.name),
     raw: text
   };
 }
