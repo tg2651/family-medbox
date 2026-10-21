@@ -152,7 +152,8 @@ async function rxImport(inp){
     if(!confirm('识别到 '+meds.length+' 种药品：\n\n'+lines+'\n\n确认全部入库并创建每日用药提醒？')){msg.textContent='已取消';return;}
     const res=await api('/prescriptions/import',{method:'POST',body:JSON.stringify({meds,create_schedule:true})});
     renderMeds();
-    const m2=$('rx_msg');if(m2){m2.style.color='var(--ok)';m2.textContent='已入库 '+res.count+' 种药品，并已按用法用量创建每日提醒';}
+    const notConv=(res.meds||[]).filter(m=>!m.converted).length;
+    const m2=$('rx_msg');if(m2){m2.style.color='var(--ok)';m2.textContent='已入库 '+res.count+' 种药品'+(notConv?('，其中 '+notConv+' 种规格未识别、已按处方名称原样入库（可稍后补充规格）'):'')+'，并已按用法用量创建每日提醒';}
   }catch(e){msg.textContent=e.message;msg.style.color='var(--bad)';}
 }
 function toggleMedForm(){const f=$('medform');f.style.display=f.style.display==='none'?'':'none';if(f.style.display==='none')stopScan();}

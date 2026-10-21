@@ -451,14 +451,29 @@ function unitFromName(name, spec) {
   if (/片/.test(s)) return '片';
   return '片';
 }
+// 从任意字段提取数字（兼容 "24盒"、"每日3次"、"三次" 等字符串）
+function num(v) {
+  if (v == null) return 0;
+  if (typeof v === 'number') return isFinite(v) ? v : 0;
+  const s = String(v);
+  const m = s.match(/\d+(?:\.\d+)?/);
+  if (m) return +m[0];
+  const cn = { '一': 1, '二': 2, '两': 2, '三': 3, '四': 4, '五': 5, '六': 6 };
+  for (const k in cn) if (s.includes(k)) return cn[k];
+  return 0;
+}
 // 解析规格中的每包装最小单位数量：100mg*14片→14片；5g*18→18袋；30ml→30ml
+// 无法解析时返回 null（不做虚假换算）
 function parsePack(spec, fbUnit) {
   const s = String(spec || '').replace(/\s/g, '');
-  let m = s.match(/\*\s*(\d+(?:\.\d+)?)\s*(片|粒|袋|支|丸|枚|贴|瓶|ml|毫升)?/i);
+  if (!s) return null;
+  let m = s.match(/\*\s*(\d+(?:\.\d+)?)(片|粒|袋|支|丸|枚|贴|瓶)?/i);
   if (m) return { perPack: +m[1], unit: m[2] || fbUnit || '片' };
-  m = s.match(/(\d+(?:\.\d+)?)\s*(ml|毫升)/i);
+  m = s.match(/(\d+(?:\.\d+)?)(片|粒|袋|支|丸|枚|贴|瓶)/);
+  if (m) return { perPack: +m[1], unit: m[2] };
+  m = s.match(/(\d+(?:\.\d+)?)(ml|毫升)/i);
   if (m) return { perPack: +m[1], unit: 'ml' };
-  return { perPack: 1, unit: fbUnit || '片' };
+  return null;
 }
 // 解析规格中的单最小单位含量：100mg*14片→{value:100,unit:'mg'}
 function parseStrength(spec) {
@@ -481,36 +496,61 @@ app.post('/api/prescriptions/import', requireAuth, (req, res) => {
   db.exec('BEGIN');
   try {
     for (const it of items) {
-      const name = String(it.name || '').trim();
-      if (!name) continue;
-      const spec = String(it.spec || '').trim();
-      const fbUnit = unitFromName(name, spec);
-      const pack = parsePack(spec, fbUnit);
-      const packQty = Number(it.pack_qty) || 0;
-      // 总库存换算成最小单位（片/粒/袋/ml）
-      const totalStock = packQty > 0 ? +(packQty * pack.perPack).toFixed(2) : (Number(it.stock_qty) || 0);
-      // 每次剂量换算成最小单位（如 400mg ÷ 100mg/片 = 4片）
-      let dosePerTime = Number(it.dose_per_time) || 0;
-      let doseUnit = String(it.dose_unit || '').trim() || pack.unit;
-      const st = parseStrength(spec);
-      if (dosePerTime > 0 && st && doseUnit.toLowerCase() === st.unit && doseUnit.toLowerCase() !== pack.unit.toLowerCase()) {
-        dosePerTime = +(dosePerTime / st.value).toFixed(2);
-        doseUnit = pack.unit;
+      // 名称中若带规格括注（如「XX片（100mg*14片）」），拆出规格
+      let name = String(it.name || '').trim();
+      let spec = String(it.spec || '').trim();
+      const pm = name.match(/[（(]([^）)]+)[）)]/);
+      if (pm) {
+        if (!spec) spec = pm[1].trim();
+        name = name.replace(/[（(][^）)]*[）)]/g, '').trim();
       }
-      const timesPerDay = Math.max(0, Number(it.times_per_day) || 0);
-      const dailyDose = +(dosePerTime * timesPerDay).toFixed(2);
-      const durationDays = Math.max(0, Number(it.duration_days) || 0);
+      if (!name) continue;
+      const fbUnit = unitFromName(name, spec);
+      const packQty = num(it.pack_qty) || num(it.stock_qty);
       const packUnit = String(it.pack_unit || '盒').trim();
-      const notes = packQty > 0 ? `处方导入：${packQty}${packUnit}${spec ? ' × ' + spec : ''}` : '处方导入';
-      // 用权威库补全厂家/批准文号
-      const extra = enrichFromCatalog({ name, spec }) || {};
+      // 用权威库补全厂家/批准文号；未收录也不影响，直接按处方名称入库
+      let extra = {};
+      try { extra = enrichFromCatalog({ name, spec }) || {}; } catch (e) { extra = {}; }
+      // 处方没写规格时，尝试用权威库规格换算
+      let pack = parsePack(spec, fbUnit);
+      if (!pack && extra.spec) pack = parsePack(extra.spec, fbUnit);
+      const inCatalog = extra.catalog_matched === true;
+
+      let totalStock, stockUnit, doseUnit, dailyDose = 0;
+      let dosePerTime = num(it.dose_per_time);
+      doseUnit = String(it.dose_unit || '').trim() || (pack ? pack.unit : fbUnit);
+      if (pack) {
+        // 规格可解析：库存换算为最小单位（片/粒/袋/ml）
+        totalStock = packQty > 0 ? +(packQty * pack.perPack).toFixed(2) : 0;
+        stockUnit = pack.unit;
+        // 每次剂量换算成最小单位（如 400mg ÷ 100mg/片 = 4片）
+        const st = parseStrength(spec || extra.spec || '');
+        if (dosePerTime > 0 && st && doseUnit.toLowerCase() === st.unit && doseUnit.toLowerCase() !== pack.unit.toLowerCase()) {
+          dosePerTime = +(dosePerTime / st.value).toFixed(2);
+          doseUnit = pack.unit;
+        }
+        dailyDose = +(dosePerTime * Math.max(0, num(it.times_per_day))).toFixed(2);
+      } else {
+        // 规格缺失/无法解析：按包装数量入库，不换算、不预估开药时间
+        totalStock = packQty;
+        stockUnit = packUnit;
+      }
+      const timesPerDay = Math.max(0, num(it.times_per_day));
+      const durationDays = Math.max(0, num(it.duration_days));
+      // 备注：记录处方原始数量，未收录/未换算的情况明确标注
+      const noteParts = [];
+      if (packQty > 0) noteParts.push(`处方导入：${packQty}${packUnit}${spec ? ' × ' + spec : ''}`);
+      else noteParts.push('处方导入');
+      if (!inCatalog) noteParts.push('基础库未收录，按处方名称录入');
+      if (!pack) noteParts.push('规格未识别，请补充规格后启用开药提醒');
+      const notes = noteParts.join('；');
       const info = db.prepare(`INSERT INTO medicines(family_id,user_id,name,spec,stock_qty,unit,daily_dose,dose_unit,notes,manufacturer,approval_no)
         VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
-        .run(req.user.family_id, uid, name, spec, totalStock, pack.unit,
+        .run(req.user.family_id, uid, name, spec, totalStock, stockUnit,
           dailyDose, doseUnit, notes, extra.manufacturer || '', extra.approval_no || '');
       const medId = Number(info.lastInsertRowid);
-      // 按用法用量自动建用药计划
-      if (createPlan && timesPerDay > 0 && dosePerTime > 0) {
+      // 按用法用量自动建用药计划（规格无法换算时不建，避免剂量错误）
+      if (createPlan && pack && timesPerDay > 0 && dosePerTime > 0) {
         const times = DEFAULT_TIMES[Math.min(4, Math.max(1, Math.round(timesPerDay)))] || DEFAULT_TIMES[4];
         let endDate = '';
         if (durationDays > 0) {
@@ -523,7 +563,7 @@ app.post('/api/prescriptions/import', requireAuth, (req, res) => {
           VALUES(?,?,?,?,?,?,?,?,?,?)`)
           .run(req.user.family_id, medId, uid, JSON.stringify(times), dosePerTime, doseUnit, 'daily', 1, startDate, endDate);
       }
-      created.push({ id: medId, name, spec, stock_qty: totalStock, unit: pack.unit, daily_dose: dailyDose, dose_unit: doseUnit, times_per_day: timesPerDay, duration_days: durationDays });
+      created.push({ id: medId, name, spec, stock_qty: totalStock, unit: stockUnit, daily_dose: dailyDose, dose_unit: doseUnit, times_per_day: timesPerDay, duration_days: durationDays, in_catalog: inCatalog, converted: !!pack });
     }
     db.exec('COMMIT');
   } catch (e) {

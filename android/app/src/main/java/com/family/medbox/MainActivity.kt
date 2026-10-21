@@ -625,7 +625,14 @@ private fun PrescriptionImportDialog(userId: Int, onClose: () -> Unit) {
                             }
                             val body = JSONObject().put("meds", arr).put("create_schedule", createPlan)
                             if (userId >= 0) body.put("user_id", userId)
-                            ApiClient.post("/api/prescriptions/import", body, 30000)
+                            val res = ApiClient.post("/api/prescriptions/import", body, 30000) as JSONObject
+                            val notConv = res.optJSONArray("meds")?.objs()?.count { !it.optBoolean("converted", true) } ?: 0
+                            android.widget.Toast.makeText(
+                                ctx,
+                                "已入库 ${res.optInt("count")} 种药品" +
+                                    if (notConv > 0) "，其中 $notConv 种规格未识别，已按处方名称原样入库" else "",
+                                android.widget.Toast.LENGTH_LONG
+                            ).show()
                             onClose()
                         } catch (e: Exception) { err = e.message ?: "入库失败" }
                         busy = false
