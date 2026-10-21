@@ -289,7 +289,12 @@ app.post('/api/ai/recognize', requireAuth, async (req, res) => {
     if (buf.length > 8 * 1024 * 1024) return bad(res, '图片过大（限 8MB）');
     const r = type === 'prescription' ? await ai.recognizePrescription(data) : await ai.recognizeMedicine(data);
     // 用本地药品库（药监局本位码数据集）按名称补全 AI 未识别出的字段
-    enrichFromCatalog(r);
+    if (type === 'prescription' && Array.isArray(r.meds)) {
+      // 处方返回的是药品数组，顶层没有 name/spec，必须逐条补全
+      r.meds = r.meds.map(m => enrichFromCatalog({ ...m }));
+    } else {
+      enrichFromCatalog(r);
+    }
     res.json(r);
   } catch (e) { bad(res, e.message || 'AI识别失败'); }
 });
@@ -544,12 +549,32 @@ app.post('/api/prescriptions/import', requireAuth, (req, res) => {
       if (!inCatalog) noteParts.push('基础库未收录，按处方名称录入');
       if (!pack) noteParts.push('规格未识别，请补充规格后启用开药提醒');
       const notes = noteParts.join('；');
-      const info = db.prepare(`INSERT INTO medicines(family_id,user_id,name,spec,stock_qty,unit,daily_dose,dose_unit,notes,manufacturer,approval_no)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
-        .run(req.user.family_id, uid, name, spec, totalStock, stockUnit,
-          dailyDose, doseUnit, notes, extra.manufacturer || '', extra.approval_no || '');
-      const medId = Number(info.lastInsertRowid);
+      // 同一成员已有同名同单位的药品 → 累加库存，避免重复扫同一张处方产生多条记录
+      const exist = db.prepare('SELECT * FROM medicines WHERE user_id=? AND name=? AND unit=? ORDER BY id DESC LIMIT 1')
+        .get(uid, name, stockUnit);
+      let medId, merged = false, finalStock = totalStock;
+      if (exist) {
+        merged = true;
+        medId = exist.id;
+        const stock = +(Number(exist.stock_qty || 0) + (totalStock > 0 ? totalStock : 0)).toFixed(2);
+        finalStock = stock;
+        const daily = dailyDose > 0 ? dailyDose : Number(exist.daily_dose || 0);
+        const du = dailyDose > 0 ? doseUnit : (exist.dose_unit || doseUnit);
+        const allNotes = [exist.notes, `${startDate} 处方再次入库${packQty > 0 ? ` +${packQty}${packUnit}` : ''}`]
+          .filter(Boolean).join('；');
+        db.prepare(`UPDATE medicines SET stock_qty=?, daily_dose=?, dose_unit=?, spec=?, notes=?, manufacturer=?, approval_no=? WHERE id=?`)
+          .run(stock, daily, du, spec || exist.spec || '', allNotes,
+            exist.manufacturer || extra.manufacturer || '',
+            exist.approval_no || extra.approval_no || '', medId);
+      } else {
+        const info = db.prepare(`INSERT INTO medicines(family_id,user_id,name,spec,stock_qty,unit,daily_dose,dose_unit,notes,manufacturer,approval_no)
+          VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
+          .run(req.user.family_id, uid, name, spec, totalStock, stockUnit,
+            dailyDose, doseUnit, notes, extra.manufacturer || '', extra.approval_no || '');
+        medId = Number(info.lastInsertRowid);
+      }
       // 按用法用量自动建用药计划（规格无法换算时不建，避免剂量错误）
+      let planCreated = false;
       if (createPlan && pack && timesPerDay > 0 && dosePerTime > 0) {
         const times = DEFAULT_TIMES[Math.min(4, Math.max(1, Math.round(timesPerDay)))] || DEFAULT_TIMES[4];
         let endDate = '';
@@ -559,11 +584,17 @@ app.post('/api/prescriptions/import', requireAuth, (req, res) => {
           const p = n => String(n).padStart(2, '0');
           endDate = `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
         }
-        db.prepare(`INSERT INTO schedules(family_id,medicine_id,user_id,times,dose_per_time,dose_unit,frequency,interval_days,start_date,end_date)
-          VALUES(?,?,?,?,?,?,?,?,?,?)`)
-          .run(req.user.family_id, medId, uid, JSON.stringify(times), dosePerTime, doseUnit, 'daily', 1, startDate, endDate);
+        // 合并时若已有完全相同的计划，不重复创建
+        const dup = db.prepare('SELECT id FROM schedules WHERE medicine_id=? AND enabled=1 AND times=? AND dose_per_time=?')
+          .get(medId, JSON.stringify(times), dosePerTime);
+        if (!dup) {
+          db.prepare(`INSERT INTO schedules(family_id,medicine_id,user_id,times,dose_per_time,dose_unit,frequency,interval_days,start_date,end_date)
+            VALUES(?,?,?,?,?,?,?,?,?,?)`)
+            .run(req.user.family_id, medId, uid, JSON.stringify(times), dosePerTime, doseUnit, 'daily', 1, startDate, endDate);
+          planCreated = true;
+        }
       }
-      created.push({ id: medId, name, spec, stock_qty: totalStock, unit: stockUnit, daily_dose: dailyDose, dose_unit: doseUnit, times_per_day: timesPerDay, duration_days: durationDays, in_catalog: inCatalog, converted: !!pack });
+      created.push({ id: medId, name, spec, stock_qty: finalStock, unit: stockUnit, daily_dose: dailyDose, dose_unit: doseUnit, times_per_day: timesPerDay, duration_days: durationDays, in_catalog: inCatalog, converted: !!pack, merged, plan_created: planCreated });
     }
     db.exec('COMMIT');
   } catch (e) {
@@ -584,6 +615,29 @@ app.patch('/api/medicines/:id', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
+// 补货：输入新买的盒数，按规格换算后累加到库存，并返回新的开药日期
+app.post('/api/medicines/:id/refill', requireAuth, (req, res) => {
+  const m = db.prepare('SELECT * FROM medicines WHERE id=?').get(req.params.id);
+  if (!m || m.family_id !== req.user.family_id) return bad(res, '药品不存在');
+  if (m.user_id !== req.user.id && req.user.role !== 'admin') return bad(res, '无权限');
+  const packQty = num(req.body.pack_qty);
+  if (packQty <= 0) return bad(res, '请输入补货数量');
+  const pack = parsePack(m.spec, unitFromName(m.name, m.spec));
+  let stock, unit;
+  if (pack) {
+    // 统一按最小单位（片/粒/袋/ml）累加；历史上按盒记的库存一并折算
+    const base = m.unit && m.unit !== pack.unit ? +(m.stock_qty * pack.perPack).toFixed(2) : +m.stock_qty || 0;
+    stock = +(base + packQty * pack.perPack).toFixed(2);
+    unit = pack.unit;
+  } else {
+    // 规格无法解析：按当前单位原样累加
+    stock = +(Number(m.stock_qty || 0) + packQty).toFixed(2);
+    unit = m.unit || '盒';
+  }
+  db.prepare('UPDATE medicines SET stock_qty=?, unit=? WHERE id=?').run(stock, unit, m.id);
+  res.json({ ok: true, stock_qty: stock, unit, refill: refillInfo({ ...m, stock_qty: stock, unit }) });
+});
+
 app.delete('/api/medicines/:id', requireAuth, (req, res) => {
   const m = db.prepare('SELECT * FROM medicines WHERE id=?').get(req.params.id);
   if (!m || m.family_id !== req.user.family_id) return bad(res, '药品不存在');
@@ -592,7 +646,6 @@ app.delete('/api/medicines/:id', requireAuth, (req, res) => {
   db.prepare('DELETE FROM medicines WHERE id=?').run(m.id);
   res.json({ ok: true });
 });
-
 // --- 用药计划 ---
 app.get('/api/schedules', requireAuth, (req, res) => {
   let uid = req.user.id;
@@ -678,9 +731,11 @@ app.post('/api/intake', requireAuth, (req, res) => {
     db.prepare('INSERT INTO intake_logs(schedule_id,user_id,medicine_id,plan_date,plan_time,status,taken_at) VALUES(?,?,?,?,?,?,?)')
       .run(sc.id, sc.user_id, sc.medicine_id, dateStr, plan_time, st, st === 'pending' ? null : new Date().toISOString());
   }
-  // 服药后扣减库存
-  if (st === 'taken') {
+  // 服药后扣减库存；改回「跳过/未服」时退回，避免重复点击造成库存错乱
+  if (st === 'taken' && (!log || log.status !== 'taken')) {
     db.prepare('UPDATE medicines SET stock_qty = MAX(0, stock_qty - ?) WHERE id=?').run(sc.dose_per_time, sc.medicine_id);
+  } else if (st !== 'taken' && log && log.status === 'taken') {
+    db.prepare('UPDATE medicines SET stock_qty = stock_qty + ? WHERE id=?').run(sc.dose_per_time, sc.medicine_id);
   }
   res.json({ ok: true });
 });
@@ -691,14 +746,17 @@ app.get('/api/alerts', requireAuth, (req, res) => {
   const meds = uid
     ? getUserMedicines(uid)
     : db.prepare('SELECT * FROM medicines WHERE family_id=?').all(req.user.family_id);
-  const refill = [];
+  const refill = [], upcoming = [];
   for (const m of meds) {
     const owner = db.prepare('SELECT display_name FROM users WHERE id=?').get(m.user_id);
     const r = refillInfo(m);
-    if (r && r.needRefill) refill.push({ ...m, owner: owner?.display_name, days_left: r.daysLeft, next_refill_date: r.nextRefillDate });
+    if (!r) continue;
+    const item = { ...m, owner: owner?.display_name, days_left: r.daysLeft, next_refill_date: r.nextRefillDate };
+    upcoming.push(item);
+    if (r.needRefill) refill.push(item);
   }
-  refill.sort((a, b) => a.days_left - b.days_left);
-  res.json({ refill });
+  upcoming.sort((a, b) => a.days_left - b.days_left);
+  res.json({ refill, upcoming });
 });
 
 // --- 管理员总览 ---

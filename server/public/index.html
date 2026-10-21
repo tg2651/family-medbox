@@ -133,7 +133,8 @@ async function renderMeds(){
   (meds.length?meds.map(m=>`<div class="med"><div class="t">${h(m.name)} <span class="sub">${h(m.spec)} ${h(m.category)}</span></div>
   <div class="sub">余 ${h(m.stock_qty)} ${h(m.unit)} · 日用量 ${h(m.daily_dose)} ${h(m.dose_unit)} ${m.location?('· 存放：'+h(m.location)):''}</div>
   ${m.approval_no?`<div class="sub">批准文号：${h(m.approval_no)}${m.barcode?(' · 条码 '+h(m.barcode)):''}</div>`:''}
-  ${m.refill&&m.refill.needRefill?`<div class="warn">库存仅够 ${m.refill.daysLeft} 天，${m.refill.nextRefillDate?h(m.refill.nextRefillDate)+' 前该开药了':'该开药了'}</div>`:(m.refill&&m.refill.nextRefillDate?`<div class="sub">预计 ${h(m.refill.nextRefillDate)} 需开药</div>`:'')}</div>`).join('')
+  ${m.refill&&m.refill.needRefill?`<div class="warn">库存仅够 ${m.refill.daysLeft} 天，${m.refill.nextRefillDate?h(m.refill.nextRefillDate)+' 前该开药了':'该开药了'}</div>`:(m.refill&&m.refill.nextRefillDate?`<div class="sub">预计 ${h(m.refill.nextRefillDate)} 需开药</div>`:'')}
+  <div style="margin-top:6px"><button class="pill" style="background:#2563eb;color:#fff" onclick="refillStock(${m.id})">已补货</button></div></div>`).join('')
   :'<div class="sub">暂无药品，点上方按钮扫码或手动添加</div>')+'</div>';
 }
 let medStream=null;
@@ -152,9 +153,27 @@ async function rxImport(inp){
     if(!confirm('识别到 '+meds.length+' 种药品：\n\n'+lines+'\n\n确认全部入库并创建每日用药提醒？')){msg.textContent='已取消';return;}
     const res=await api('/prescriptions/import',{method:'POST',body:JSON.stringify({meds,create_schedule:true})});
     renderMeds();
-    const notConv=(res.meds||[]).filter(m=>!m.converted).length;
-    const m2=$('rx_msg');if(m2){m2.style.color='var(--ok)';m2.textContent='已入库 '+res.count+' 种药品'+(notConv?('，其中 '+notConv+' 种规格未识别、已按处方名称原样入库（可稍后补充规格）'):'')+'，并已按用法用量创建每日提醒';}
+    const list=res.meds||[];
+    const notConv=list.filter(m=>!m.converted).length;
+    const merged=list.filter(m=>m.merged).length;
+    const plans=list.filter(m=>m.plan_created).length;
+    const m2=$('rx_msg');if(m2){m2.style.color='var(--ok)';m2.textContent='已入库 '+res.count+' 种药品'+
+      (merged?('，其中 '+merged+' 种已有药品已累加库存'):'')+
+      (plans?('，新建 '+plans+' 个服药提醒'):'')+
+      (notConv?('；'+notConv+' 种规格未识别，暂不提醒开药（可稍后补充规格）'):'');}
   }catch(e){msg.textContent=e.message;msg.style.color='var(--bad)';}
+}
+// 已补货：按「买了几盒」由服务端按规格折算成最小单位累加库存
+async function refillStock(id){
+  const n=prompt('本次买了几盒？');
+  if(n===null)return;
+  const q=Number(n);
+  if(!(q>0)){alert('请输入正确的数量');return;}
+  try{
+    const r=await api('/medicines/'+id+'/refill',{method:'POST',body:JSON.stringify({pack_qty:q})});
+    renderMeds();
+    alert('已补货，当前库存 '+r.stock_qty+' '+r.unit+(r.refill&&r.refill.nextRefillDate?('，预计 '+r.refill.nextRefillDate+' 需再开药'):''));
+  }catch(e){alert(e.message);}
 }
 function toggleMedForm(){const f=$('medform');f.style.display=f.style.display==='none'?'':'none';if(f.style.display==='none')stopScan();}
 function medMsg(s){const e=$('mf_msg');if(e){e.textContent=s;e.style.color='';}}

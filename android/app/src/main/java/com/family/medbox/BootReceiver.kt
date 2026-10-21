@@ -5,14 +5,15 @@ import android.content.Context
 import android.content.Intent
 
 /**
- * 开机自启：使用缓存的计划数据重新注册当日提醒
+ * 开机自启：使用本地缓存的计划与药品重新注册提醒（无需联网）
  */
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(ctx: Context, intent: Intent) {
-        if (intent.action != Intent.ACTION_BOOT_COMPLETED) return
+        val action = intent.action
+        // 开机或 App 升级后系统会清空闹钟，需要重排
+        if (action != Intent.ACTION_BOOT_COMPLETED && action != Intent.ACTION_MY_PACKAGE_REPLACED) return
         Store.load(ctx)
         if (ApiClient.token.isEmpty()) return // 未登录不注册
-        val cached = Store.schedulesCache(ctx) ?: return
-        ReminderScheduler.scheduleAll(ctx, cached)
+        ReminderScheduler.rescheduleFromCache(ctx)
     }
 }

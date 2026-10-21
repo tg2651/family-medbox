@@ -8,35 +8,64 @@ import android.content.Context
 import android.content.Intent
 import android.os.Build
 import androidx.core.app.NotificationCompat
+import java.time.LocalDate
 
 /**
- * 服药提醒接收器：闹钟到达时发送本地通知
+ * 提醒接收器：闹钟到达时发送本地通知
+ * - intake：服药提醒
+ * - refill：开药提醒（库存不足，该买药了）
+ * 通知发出后按本地缓存重排提醒，把未来 3 天滚动续上
  */
 class ReminderReceiver : BroadcastReceiver() {
 
     override fun onReceive(ctx: Context, intent: Intent) {
+        val type = intent.getStringExtra("type") ?: "intake"
+        if (type == "refill") notifyRefill(ctx, intent) else notifyIntake(ctx, intent)
+        // 无论是否弹出通知都续排（当天已提醒过也要继续往后排）
+        runCatching { ReminderScheduler.rescheduleFromCache(ctx) }
+    }
+
+    private fun notifyIntake(ctx: Context, intent: Intent) {
         val name = intent.getStringExtra("name") ?: return
         val time = intent.getStringExtra("time") ?: ""
         val dose = intent.getDoubleExtra("dose", 1.0)
         val unit = intent.getStringExtra("unit") ?: "片"
+        val doseStr = if (dose % 1.0 == 0.0) dose.toInt().toString() else dose.toString()
+        show(ctx, "med_reminder", "服药提醒", "服药提醒 $time", "该吃药了：$name $doseStr$unit")
+    }
 
+    private fun notifyRefill(ctx: Context, intent: Intent) {
+        val name = intent.getStringExtra("name") ?: return
+        val medId = intent.getIntExtra("med_id", 0)
+        val daysLeft = intent.getIntExtra("days_left", 0)
+        val next = intent.getStringExtra("next_refill_date") ?: ""
+        val today = LocalDate.now().toString()
+        // 同一种药当天只提醒一次，避免每次打开 App 都弹
+        if (Store.lastRefillNotified(ctx, medId) == today) return
+        Store.markRefillNotified(ctx, medId, today)
+        val tail = when {
+            daysLeft <= 0 -> "库存已用完，请尽快开药"
+            next.isNotEmpty() -> "还能服 $daysLeft 天（$next 用完）"
+            else -> "还能服 $daysLeft 天"
+        }
+        show(ctx, "refill_reminder", "开药提醒", "该开药了：$name", tail)
+    }
+
+    private fun show(ctx: Context, channelId: String, channelName: String, title: String, text: String) {
         val nm = ctx.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
-        // 高优先级通知渠道（安卓 8.0+ 必须建渠道）
         if (Build.VERSION.SDK_INT >= 26) {
             nm.createNotificationChannel(
-                NotificationChannel("med_reminder", "服药提醒", NotificationManager.IMPORTANCE_HIGH)
+                NotificationChannel(channelId, channelName, NotificationManager.IMPORTANCE_HIGH)
             )
         }
-        // 点击通知打开 APP
         val open = PendingIntent.getActivity(
             ctx, 0, Intent(ctx, MainActivity::class.java),
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
-        val doseStr = if (dose % 1.0 == 0.0) dose.toInt().toString() else dose.toString()
-        val n = NotificationCompat.Builder(ctx, "med_reminder")
+        val n = NotificationCompat.Builder(ctx, channelId)
             .setSmallIcon(android.R.drawable.ic_popup_reminder)
-            .setContentTitle("服药提醒 $time")
-            .setContentText("该吃药了：$name $doseStr$unit")
+            .setContentTitle(title)
+            .setContentText(text)
             .setContentIntent(open)
             .setAutoCancel(true)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
